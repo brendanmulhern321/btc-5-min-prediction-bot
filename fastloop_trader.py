@@ -207,39 +207,75 @@ def simmer_request(path, method="GET", data=None, api_key=None):
 # Sprint Market Discovery
 # =============================================================================
 
-def discover_fast_market_markets(asset="BTC", window="5m"):
-    """Find active fast markets on Polymarket via Gamma API."""
+def discover_fast_market_markets(asset="BTC", window="5m", api_key=None):
+    """Find active fast markets via Simmer API (primary) and Gamma API (fallback)."""
     patterns = ASSET_PATTERNS.get(asset, ASSET_PATTERNS["BTC"])
-    url = (
-        "https://gamma-api.polymarket.com/markets"
-        "?limit=100&closed=false&order=createdAt&ascending=false"
-    )
-    result = _api_request(url)
-    if not result or isinstance(result, dict) and result.get("error"):
-        return []
-
     markets = []
-    for m in result:
-        q = (m.get("question") or "").lower()
-        slug = m.get("slug", "")
-        # Match by window slug OR hourly "up or down" markets
-        matches_window = f"-{window}-" in slug
-        is_hourly = "up or down" in q and "-5m-" not in slug and "-15m-" not in slug
-        if any(p in q for p in patterns) and (matches_window or is_hourly):
-            condition_id = m.get("conditionId", "")
-            closed = m.get("closed", False)
-            if not closed and slug:
-                # Parse end time from question (e.g., "5:30AM-5:35AM ET")
-                end_time = _parse_fast_market_end_time(m.get("question", ""))
+
+    # Primary: Simmer API — has markets already imported and ready to trade
+    if api_key:
+        result = simmer_request("/api/sdk/markets", api_key=api_key)
+        if result and isinstance(result, dict) and "markets" in result:
+            for m in result["markets"]:
+                q = (m.get("question") or "").lower()
+                if not any(p in q for p in patterns):
+                    continue
+                if "up or down" not in q:
+                    continue
+                if m.get("status") != "active":
+                    continue
+                # Parse end time from resolves_at or question
+                end_time = None
+                resolves_at = m.get("resolves_at", "")
+                if resolves_at:
+                    try:
+                        # Handle "2026-02-15 18:15:00Z" format
+                        resolves_at = resolves_at.replace("Z", "+00:00").replace(" ", "T")
+                        end_time = datetime.fromisoformat(resolves_at)
+                    except Exception:
+                        pass
+                if not end_time:
+                    end_time = _parse_fast_market_end_time(m.get("question", ""))
+                yes_price = m.get("external_price_yes", 0.5)
+                no_price = 1 - yes_price if yes_price else 0.5
                 markets.append({
                     "question": m.get("question", ""),
-                    "slug": slug,
-                    "condition_id": condition_id,
+                    "slug": "",
+                    "simmer_market_id": m.get("id", ""),
+                    "condition_id": "",
                     "end_time": end_time,
-                    "outcomes": m.get("outcomes", []),
-                    "outcome_prices": m.get("outcomePrices", "[]"),
-                    "fee_rate_bps": int(m.get("fee_rate_bps") or m.get("feeRateBps") or 0),
+                    "outcomes": ["Yes", "No"],
+                    "outcome_prices": json.dumps([str(yes_price), str(no_price)]),
+                    "fee_rate_bps": 0,
                 })
+
+    # Fallback: Gamma API for markets not yet on Simmer
+    if not markets:
+        url = (
+            "https://gamma-api.polymarket.com/markets"
+            "?limit=100&closed=false&order=createdAt&ascending=false"
+        )
+        result = _api_request(url)
+        if result and not (isinstance(result, dict) and result.get("error")):
+            for m in result:
+                q = (m.get("question") or "").lower()
+                slug = m.get("slug", "")
+                matches_window = f"-{window}-" in slug
+                is_hourly = "up or down" in q and "-5m-" not in slug and "-15m-" not in slug
+                if any(p in q for p in patterns) and (matches_window or is_hourly):
+                    closed = m.get("closed", False)
+                    if not closed and slug:
+                        end_time = _parse_fast_market_end_time(m.get("question", ""))
+                        markets.append({
+                            "question": m.get("question", ""),
+                            "slug": slug,
+                            "simmer_market_id": "",
+                            "condition_id": m.get("conditionId", ""),
+                            "end_time": end_time,
+                            "outcomes": m.get("outcomes", []),
+                            "outcome_prices": m.get("outcomePrices", "[]"),
+                            "fee_rate_bps": int(m.get("fee_rate_bps") or m.get("feeRateBps") or 0),
+                        })
     return markets
 
 
@@ -614,7 +650,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
 
     # Step 1: Discover fast markets
     log(f"\n🔍 Discovering {ASSET} fast markets...")
-    markets = discover_fast_market_markets(ASSET, WINDOW)
+    markets = discover_fast_market_markets(ASSET, WINDOW, api_key=api_key)
     log(f"  Found {len(markets)} active fast markets")
 
     if not markets:
@@ -747,14 +783,16 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"  Divergence: {divergence:.3f}", force=True)
 
     # Step 5: Import & Trade
-    log(f"\n🔗 Importing to Simmer...", force=True)
-    market_id, import_error = import_fast_market_market(api_key, best["slug"])
-
-    if not market_id:
-        log(f"  ❌ Import failed: {import_error}", force=True)
-        return
-
-    log(f"  ✅ Market ID: {market_id[:16]}...", force=True)
+    market_id = best.get("simmer_market_id", "")
+    if market_id:
+        log(f"\n🔗 Using Simmer market: {market_id[:16]}...", force=True)
+    else:
+        log(f"\n🔗 Importing to Simmer...", force=True)
+        market_id, import_error = import_fast_market_market(api_key, best["slug"])
+        if not market_id:
+            log(f"  ❌ Import failed: {import_error}", force=True)
+            return
+        log(f"  ✅ Market ID: {market_id[:16]}...", force=True)
 
     if dry_run:
         est_shares = position_size / price if price > 0 else 0
