@@ -59,7 +59,7 @@ CONFIG_SCHEMA = {
                          "help": "Minutes of price history for momentum calc"},
     "min_time_remaining": {"default": 60, "env": "SIMMER_SPRINT_MIN_TIME", "type": int,
                            "help": "Skip fast_markets with less than this many seconds remaining"},
-    "max_time_remaining": {"default": 600, "env": "SIMMER_SPRINT_MAX_TIME", "type": int,
+    "max_time_remaining": {"default": 86400, "env": "SIMMER_SPRINT_MAX_TIME", "type": int,
                            "help": "Skip fast_markets with more than this many seconds remaining"},
     "asset": {"default": "BTC", "env": "SIMMER_SPRINT_ASSET", "type": str,
               "help": "Asset to trade (BTC, ETH, SOL)"},
