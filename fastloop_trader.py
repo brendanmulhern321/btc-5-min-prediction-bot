@@ -221,19 +221,54 @@ def _is_5m_market(question):
     return 4 <= diff <= 6  # 5 minutes with tolerance
 
 
+def _import_current_5m_markets(asset, api_key):
+    """Construct and import the current and next 5-minute markets by slug."""
+    now_utc = datetime.now(timezone.utc)
+    now_et = now_utc - timedelta(hours=5)
+    markets = []
+    asset_lower = asset.lower()
+
+    # Generate current and next 2 windows
+    for offset in range(3):
+        minute = (now_et.minute // 5) * 5
+        window_start = now_et.replace(minute=minute, second=0, microsecond=0) + timedelta(minutes=5 * offset)
+        window_end = window_start + timedelta(minutes=5)
+        start_unix = int((window_start + timedelta(hours=5)).timestamp())
+        slug = f"{asset_lower}-updown-5m-{start_unix}"
+
+        market_id, error = import_fast_market_market(api_key, slug)
+        if market_id:
+            end_time = (window_end + timedelta(hours=5)).replace(tzinfo=timezone.utc)
+            remaining = (end_time - now_utc).total_seconds()
+            markets.append({
+                "question": f"{asset} Up or Down - {window_start.strftime('%B %d')}, {window_start.strftime('%I:%M%p')}-{window_end.strftime('%I:%M%p')} ET",
+                "slug": slug,
+                "simmer_market_id": market_id,
+                "condition_id": "",
+                "end_time": end_time,
+                "outcomes": ["Yes", "No"],
+                "outcome_prices": json.dumps(["0.5", "0.5"]),
+                "fee_rate_bps": 0,
+            })
+    return markets
+
+
 def discover_fast_market_markets(asset="BTC", window="5m", api_key=None):
-    """Find active fast markets via Simmer API (primary) and Gamma API (fallback)."""
+    """Find active fast markets. For 5m, imports current markets directly."""
     patterns = ASSET_PATTERNS.get(asset, ASSET_PATTERNS["BTC"])
     markets = []
-    seen_questions = set()
+    seen_ids = set()
 
-    def _matches_window(question, slug):
-        """Check if market matches the desired window."""
-        if window == "5m":
-            return _is_5m_market(question)
-        return f"-{window}-" in slug
+    # For 5m: always import the current/next windows directly
+    if window == "5m" and api_key:
+        live_markets = _import_current_5m_markets(asset, api_key)
+        for m in live_markets:
+            mid = m.get("simmer_market_id", "")
+            if mid:
+                seen_ids.add(mid)
+            markets.append(m)
 
-    # Primary: Simmer API — has markets already imported and ready to trade
+    # Also check Simmer API for other imported markets
     if api_key:
         result = simmer_request("/api/sdk/markets", api_key=api_key)
         if result and isinstance(result, dict) and "markets" in result:
@@ -245,10 +280,12 @@ def discover_fast_market_markets(asset="BTC", window="5m", api_key=None):
                     continue
                 if m.get("status") != "active":
                     continue
-                question_raw = m.get("question", "")
-                if not _matches_window(question_raw, ""):
+                mid = m.get("id", "")
+                if mid in seen_ids:
                     continue
-                # Parse end time from resolves_at or question
+                question_raw = m.get("question", "")
+                if window == "5m" and not _is_5m_market(question_raw):
+                    continue
                 end_time = None
                 resolves_at = m.get("resolves_at", "")
                 if resolves_at:
@@ -261,11 +298,11 @@ def discover_fast_market_markets(asset="BTC", window="5m", api_key=None):
                     end_time = _parse_fast_market_end_time(question_raw)
                 yes_price = m.get("external_price_yes", 0.5)
                 no_price = 1 - yes_price if yes_price else 0.5
-                seen_questions.add(question_raw)
+                seen_ids.add(mid)
                 markets.append({
                     "question": question_raw,
                     "slug": "",
-                    "simmer_market_id": m.get("id", ""),
+                    "simmer_market_id": mid,
                     "condition_id": "",
                     "end_time": end_time,
                     "outcomes": ["Yes", "No"],
@@ -273,38 +310,6 @@ def discover_fast_market_markets(asset="BTC", window="5m", api_key=None):
                     "fee_rate_bps": 0,
                 })
 
-    # Also check Gamma API for markets not yet imported to Simmer
-    url = (
-        "https://gamma-api.polymarket.com/markets"
-        "?limit=100&closed=false&order=createdAt&ascending=false"
-    )
-    result = _api_request(url)
-    if result and not (isinstance(result, dict) and result.get("error")):
-        for m in result:
-            q = (m.get("question") or "").lower()
-            question_raw = m.get("question", "")
-            slug = m.get("slug", "")
-            if question_raw in seen_questions:
-                continue
-            if not any(p in q for p in patterns):
-                continue
-            if "up or down" not in q:
-                continue
-            if not _matches_window(question_raw, slug):
-                continue
-            closed = m.get("closed", False)
-            if not closed and slug:
-                end_time = _parse_fast_market_end_time(question_raw)
-                markets.append({
-                    "question": question_raw,
-                    "slug": slug,
-                    "simmer_market_id": "",
-                    "condition_id": m.get("conditionId", ""),
-                    "end_time": end_time,
-                    "outcomes": m.get("outcomes", []),
-                    "outcome_prices": m.get("outcomePrices", "[]"),
-                    "fee_rate_bps": int(m.get("fee_rate_bps") or m.get("feeRateBps") or 0),
-                })
     return markets
 
 
