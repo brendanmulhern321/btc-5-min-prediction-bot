@@ -804,9 +804,17 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     if not dry_run:
         existing_positions = get_positions(api_key)
         if existing_positions:
-            fast_market_positions = [p for p in existing_positions
-                                    if "up or down" in (p.get("question", "") or "").lower()
-                                    and not p.get("redeemable")]
+            now_check = datetime.now(timezone.utc)
+            fast_market_positions = []
+            for p in existing_positions:
+                if "up or down" not in (p.get("question", "") or "").lower():
+                    continue
+                if p.get("redeemable"):
+                    continue
+                pos_end = _parse_fast_market_end_time(p.get("question", ""))
+                if pos_end and pos_end < now_check:
+                    continue  # market already ended (resolved loss)
+                fast_market_positions.append(p)
             if fast_market_positions:
                 log(f"  ⏸️  Already have {len(fast_market_positions)} active fast market position(s) — skip")
                 if not quiet:
