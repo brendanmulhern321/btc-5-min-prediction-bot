@@ -207,10 +207,31 @@ def simmer_request(path, method="GET", data=None, api_key=None):
 # Sprint Market Discovery
 # =============================================================================
 
+def _is_5m_market(question):
+    """Check if question describes a 5-minute market window."""
+    import re
+    match = re.search(r'(\d{1,2}):(\d{2})(AM|PM)\s*-\s*(\d{1,2}):(\d{2})(AM|PM)', question)
+    if not match:
+        return False
+    h1, m1, p1 = int(match.group(1)), int(match.group(2)), match.group(3)
+    h2, m2, p2 = int(match.group(4)), int(match.group(5)), match.group(6)
+    t1 = (h1 % 12 + (12 if p1 == "PM" else 0)) * 60 + m1
+    t2 = (h2 % 12 + (12 if p2 == "PM" else 0)) * 60 + m2
+    diff = t2 - t1
+    return 4 <= diff <= 6  # 5 minutes with tolerance
+
+
 def discover_fast_market_markets(asset="BTC", window="5m", api_key=None):
     """Find active fast markets via Simmer API (primary) and Gamma API (fallback)."""
     patterns = ASSET_PATTERNS.get(asset, ASSET_PATTERNS["BTC"])
     markets = []
+    seen_questions = set()
+
+    def _matches_window(question, slug):
+        """Check if market matches the desired window."""
+        if window == "5m":
+            return _is_5m_market(question)
+        return f"-{window}-" in slug
 
     # Primary: Simmer API — has markets already imported and ready to trade
     if api_key:
@@ -224,29 +245,25 @@ def discover_fast_market_markets(asset="BTC", window="5m", api_key=None):
                     continue
                 if m.get("status") != "active":
                     continue
-                # Filter by window: 5m markets have "HH:MM-HH:MM" pattern
-                import re
                 question_raw = m.get("question", "")
-                if window == "5m" and not re.search(r'\d{1,2}:\d{2}[AP]M\s*-\s*\d{1,2}:\d{2}[AP]M', question_raw):
-                    continue
-                if window == "15m" and not re.search(r'\d{1,2}:\d{2}[AP]M\s*-\s*\d{1,2}:\d{2}[AP]M', question_raw):
+                if not _matches_window(question_raw, ""):
                     continue
                 # Parse end time from resolves_at or question
                 end_time = None
                 resolves_at = m.get("resolves_at", "")
                 if resolves_at:
                     try:
-                        # Handle "2026-02-15 18:15:00Z" format
                         resolves_at = resolves_at.replace("Z", "+00:00").replace(" ", "T")
                         end_time = datetime.fromisoformat(resolves_at)
                     except Exception:
                         pass
                 if not end_time:
-                    end_time = _parse_fast_market_end_time(m.get("question", ""))
+                    end_time = _parse_fast_market_end_time(question_raw)
                 yes_price = m.get("external_price_yes", 0.5)
                 no_price = 1 - yes_price if yes_price else 0.5
+                seen_questions.add(question_raw)
                 markets.append({
-                    "question": m.get("question", ""),
+                    "question": question_raw,
                     "slug": "",
                     "simmer_market_id": m.get("id", ""),
                     "condition_id": "",
@@ -256,33 +273,38 @@ def discover_fast_market_markets(asset="BTC", window="5m", api_key=None):
                     "fee_rate_bps": 0,
                 })
 
-    # Fallback: Gamma API for markets not yet on Simmer
-    if not markets:
-        url = (
-            "https://gamma-api.polymarket.com/markets"
-            "?limit=100&closed=false&order=createdAt&ascending=false"
-        )
-        result = _api_request(url)
-        if result and not (isinstance(result, dict) and result.get("error")):
-            for m in result:
-                q = (m.get("question") or "").lower()
-                slug = m.get("slug", "")
-                matches_window = f"-{window}-" in slug
-                is_hourly = "up or down" in q and "-5m-" not in slug and "-15m-" not in slug
-                if any(p in q for p in patterns) and (matches_window or is_hourly):
-                    closed = m.get("closed", False)
-                    if not closed and slug:
-                        end_time = _parse_fast_market_end_time(m.get("question", ""))
-                        markets.append({
-                            "question": m.get("question", ""),
-                            "slug": slug,
-                            "simmer_market_id": "",
-                            "condition_id": m.get("conditionId", ""),
-                            "end_time": end_time,
-                            "outcomes": m.get("outcomes", []),
-                            "outcome_prices": m.get("outcomePrices", "[]"),
-                            "fee_rate_bps": int(m.get("fee_rate_bps") or m.get("feeRateBps") or 0),
-                        })
+    # Also check Gamma API for markets not yet imported to Simmer
+    url = (
+        "https://gamma-api.polymarket.com/markets"
+        "?limit=100&closed=false&order=createdAt&ascending=false"
+    )
+    result = _api_request(url)
+    if result and not (isinstance(result, dict) and result.get("error")):
+        for m in result:
+            q = (m.get("question") or "").lower()
+            question_raw = m.get("question", "")
+            slug = m.get("slug", "")
+            if question_raw in seen_questions:
+                continue
+            if not any(p in q for p in patterns):
+                continue
+            if "up or down" not in q:
+                continue
+            if not _matches_window(question_raw, slug):
+                continue
+            closed = m.get("closed", False)
+            if not closed and slug:
+                end_time = _parse_fast_market_end_time(question_raw)
+                markets.append({
+                    "question": question_raw,
+                    "slug": slug,
+                    "simmer_market_id": "",
+                    "condition_id": m.get("conditionId", ""),
+                    "end_time": end_time,
+                    "outcomes": m.get("outcomes", []),
+                    "outcome_prices": m.get("outcomePrices", "[]"),
+                    "fee_rate_bps": int(m.get("fee_rate_bps") or m.get("feeRateBps") or 0),
+                })
     return markets
 
 
