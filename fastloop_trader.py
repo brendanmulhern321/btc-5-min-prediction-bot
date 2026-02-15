@@ -212,7 +212,7 @@ def discover_fast_market_markets(asset="BTC", window="5m"):
     patterns = ASSET_PATTERNS.get(asset, ASSET_PATTERNS["BTC"])
     url = (
         "https://gamma-api.polymarket.com/markets"
-        "?limit=20&closed=false&tag=crypto&order=createdAt&ascending=false"
+        "?limit=100&closed=false&order=createdAt&ascending=false"
     )
     result = _api_request(url)
     if not result or isinstance(result, dict) and result.get("error"):
@@ -222,8 +222,10 @@ def discover_fast_market_markets(asset="BTC", window="5m"):
     for m in result:
         q = (m.get("question") or "").lower()
         slug = m.get("slug", "")
+        # Match by window slug OR hourly "up or down" markets
         matches_window = f"-{window}-" in slug
-        if any(p in q for p in patterns) and matches_window:
+        is_hourly = "up or down" in q and "-5m-" not in slug and "-15m-" not in slug
+        if any(p in q for p in patterns) and (matches_window or is_hourly):
             condition_id = m.get("conditionId", "")
             closed = m.get("closed", False)
             if not closed and slug:
@@ -243,26 +245,43 @@ def discover_fast_market_markets(asset="BTC", window="5m"):
 
 def _parse_fast_market_end_time(question):
     """Parse end time from fast market question.
-    e.g., 'Bitcoin Up or Down - February 15, 5:30AM-5:35AM ET' → datetime
+    Handles:
+      'Bitcoin Up or Down - February 15, 5:30AM-5:35AM ET' → datetime (5m/15m)
+      'Bitcoin Up or Down - February 17, 1PM ET' → datetime (hourly)
     """
     import re
-    # Match pattern: "Month Day, StartTime-EndTime ET"
+    year = datetime.now(timezone.utc).year
+
+    # Try ranged format first: "Month Day, StartTime-EndTime ET"
     pattern = r'(\w+ \d+),.*?-\s*(\d{1,2}:\d{2}(?:AM|PM))\s*ET'
     match = re.search(pattern, question)
-    if not match:
-        return None
-    try:
-        date_str = match.group(1)
-        time_str = match.group(2)
-        year = datetime.now(timezone.utc).year
-        dt_str = f"{date_str} {year} {time_str}"
-        # Parse as ET (UTC-5)
-        dt = datetime.strptime(dt_str, "%B %d %Y %I:%M%p")
-        # Convert ET to UTC (+5 hours)
-        dt = dt.replace(tzinfo=timezone.utc) + timedelta(hours=5)
-        return dt
-    except Exception:
-        return None
+    if match:
+        try:
+            date_str = match.group(1)
+            time_str = match.group(2)
+            dt = datetime.strptime(f"{date_str} {year} {time_str}", "%B %d %Y %I:%M%p")
+            dt = dt.replace(tzinfo=timezone.utc) + timedelta(hours=5)
+            return dt
+        except Exception:
+            pass
+
+    # Try hourly format: "Month Day, TimeAM/PM ET"
+    pattern_hourly = r'(\w+ \d+),\s*(\d{1,2}(?::\d{2})?(?:AM|PM))\s*ET'
+    match = re.search(pattern_hourly, question)
+    if match:
+        try:
+            date_str = match.group(1)
+            time_str = match.group(2)
+            # Add :00 if no minutes (e.g., "1PM" -> "1:00PM")
+            if ":" not in time_str:
+                time_str = time_str[:-2] + ":00" + time_str[-2:]
+            dt = datetime.strptime(f"{date_str} {year} {time_str}", "%B %d %Y %I:%M%p")
+            dt = dt.replace(tzinfo=timezone.utc) + timedelta(hours=5)
+            return dt
+        except Exception:
+            pass
+
+    return None
 
 
 def find_best_fast_market(markets):
