@@ -56,7 +56,7 @@ def sell_position(api_key, market_id, side, amount):
     result = api_request("/api/sdk/trade", method="POST", data={
         "market_id": market_id,
         "side": side,
-        "amount": amount,
+        "shares": amount,
         "action": "sell",
         "venue": "polymarket",
         "source": "sdk:close_positions",
@@ -77,18 +77,21 @@ def main():
     print(f"Found {len(positions)} position(s):\n")
 
     for i, pos in enumerate(positions):
-        question = pos.get("question", pos.get("title", "Unknown"))
-        market_id = pos.get("market_id", pos.get("marketId", ""))
-        side = pos.get("side", pos.get("outcome", ""))
-        shares = pos.get("shares", pos.get("size", 0))
-        avg_price = pos.get("avg_price", pos.get("averagePrice", 0))
-        current_value = pos.get("current_value", pos.get("value", 0))
+        question = pos.get("question", "Unknown")
+        market_id = pos.get("market_id", "")
+        shares_yes = pos.get("shares_yes", 0)
+        shares_no = pos.get("shares_no", 0)
+        avg_cost = pos.get("avg_cost", 0)
+        current_value = pos.get("current_value", 0)
+        pnl = pos.get("pnl", 0)
+
+        side = "NO" if shares_no > shares_yes else "YES"
+        shares = shares_no if shares_no > shares_yes else shares_yes
 
         print(f"  [{i+1}] {question}")
-        print(f"      Side: {side} | Shares: {shares} | Avg price: ${avg_price}")
+        print(f"      Side: {side} | Shares: {shares:.2f} | Avg cost: ${avg_cost:.4f}")
+        print(f"      Value: ${current_value:.2f} | PnL: ${pnl:.4f}")
         print(f"      Market ID: {market_id}")
-        if current_value:
-            print(f"      Current value: ${current_value}")
         print()
 
     if "--dry-run" in sys.argv:
@@ -98,25 +101,30 @@ def main():
     print("Closing all positions...\n")
 
     for pos in positions:
-        question = pos.get("question", pos.get("title", "Unknown"))
-        market_id = pos.get("market_id", pos.get("marketId", ""))
-        side = pos.get("side", pos.get("outcome", ""))
-        shares = pos.get("shares", pos.get("size", 0))
+        question = pos.get("question", "Unknown")
+        market_id = pos.get("market_id", "")
+        shares_yes = pos.get("shares_yes", 0)
+        shares_no = pos.get("shares_no", 0)
 
-        if not market_id or not shares:
+        side = "no" if shares_no > shares_yes else "yes"
+        shares = shares_no if shares_no > shares_yes else shares_yes
+
+        if not market_id or shares <= 0:
             print(f"  Skipping '{question}' — no market_id or shares")
             continue
 
         print(f"  Closing: {question}")
-        print(f"    Selling {shares} {side} shares...")
+        print(f"    Selling {shares:.2f} {side.upper()} shares...")
 
         result = sell_position(api_key, market_id, side, shares)
 
         if result and not result.get("error"):
-            print(f"    ✅ Closed successfully")
+            print(f"    [OK] Closed successfully")
+            print(f"    Response: {json.dumps(result)}")
         else:
             error = result.get("error", "Unknown error") if result else "No response"
-            print(f"    ❌ Failed: {error}")
+            print(f"    [FAIL] {error}")
+            print(f"    Response: {json.dumps(result)}")
         print()
 
     print("Done. Fetching updated portfolio...")
