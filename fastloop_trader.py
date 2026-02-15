@@ -595,6 +595,34 @@ def get_positions(api_key):
     return []
 
 
+def redeem_resolved_positions(api_key, log_fn=None):
+    """Auto-redeem any resolved positions to reclaim balance."""
+    if log_fn is None:
+        log_fn = print
+    positions = get_positions(api_key)
+    redeemed = 0
+    for pos in positions:
+        if not pos.get("redeemable"):
+            continue
+        market_id = pos.get("market_id", "")
+        side = pos.get("redeemable_side", "")
+        question = pos.get("question", "Unknown")
+        if not market_id or not side:
+            continue
+        log_fn(f"  Redeeming: {question} ({side})")
+        result = simmer_request("/api/sdk/redeem", method="POST", data={
+            "market_id": market_id,
+            "side": side,
+        }, api_key=api_key)
+        if result and not result.get("error"):
+            log_fn(f"  Redeemed successfully")
+            redeemed += 1
+        else:
+            error = result.get("error", "Unknown") if result else "No response"
+            log_fn(f"  Redeem failed: {error}")
+    return redeemed
+
+
 def execute_trade(api_key, market_id, side, amount):
     """Execute a trade on Simmer."""
     return simmer_request("/api/sdk/trade", method="POST", data={
@@ -681,6 +709,11 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         portfolio = get_portfolio(api_key)
         if portfolio and not portfolio.get("error"):
             log(f"  Balance: ${portfolio.get('balance_usdc', 0):.2f}")
+
+    # Step 0: Auto-redeem any resolved positions
+    redeemed = redeem_resolved_positions(api_key, log_fn=log)
+    if redeemed > 0:
+        log(f"  Redeemed {redeemed} resolved position(s)")
 
     # Step 1: Discover fast markets
     log(f"\n🔍 Discovering {ASSET} fast markets...")
