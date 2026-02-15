@@ -53,7 +53,7 @@ CONFIG_SCHEMA = {
     "max_position": {"default": 5.0, "env": "SIMMER_SPRINT_MAX_POSITION", "type": float,
                      "help": "Max $ per trade"},
     "signal_source": {"default": "binance", "env": "SIMMER_SPRINT_SIGNAL", "type": str,
-                      "help": "Price feed source (binance, coingecko)"},
+                      "help": "Price feed source (binance, kraken, coingecko)"},
     "lookback_minutes": {"default": 5, "env": "SIMMER_SPRINT_LOOKBACK", "type": int,
                          "help": "Minutes of price history for momentum calc"},
     "min_time_remaining": {"default": 60, "env": "SIMMER_SPRINT_MIN_TIME", "type": int,
@@ -362,11 +362,82 @@ def get_coingecko_momentum(asset="bitcoin", lookback_minutes=5):
 COINGECKO_ASSETS = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana"}
 
 
+def get_kraken_momentum(pair="XXBTZUSD", lookback_minutes=5):
+    """Get price momentum from Kraken public API.
+    Returns: {momentum_pct, direction, price_now, price_then, avg_volume, candles}
+    """
+    # Kraken OHLC: interval 1 = 1 minute
+    url = f"https://api.kraken.com/0/public/OHLC?pair={pair}&interval=1"
+    result = _api_request(url)
+
+    if not result:
+        print("  ⚠️  Kraken API returned empty response", file=sys.stderr, flush=True)
+        return None
+    if isinstance(result, dict) and result.get("error"):
+        errors = result.get("error", [])
+        if errors:
+            print(f"  ⚠️  Kraken API error: {', '.join(errors)}", file=sys.stderr, flush=True)
+        return None
+
+    try:
+        # Kraken response: {"error":[],"result":{"XXBTZUSD":[[time,open,high,low,close,vwap,volume,count],...]}}
+        result_data = result.get("result", {})
+        # Get the pair data (key might vary slightly)
+        candles = None
+        for key in result_data:
+            if key != "last":
+                candles = result_data[key]
+                break
+
+        if not candles or len(candles) < lookback_minutes:
+            return None
+
+        # Take last N candles
+        recent_candles = candles[-lookback_minutes:]
+        if len(recent_candles) < 2:
+            return None
+
+        # Kraken format: [time, open, high, low, close, vwap, volume, count]
+        price_then = float(recent_candles[0][1])   # open of oldest candle
+        price_now = float(recent_candles[-1][4])    # close of newest candle
+        momentum_pct = ((price_now - price_then) / price_then) * 100
+        direction = "up" if momentum_pct > 0 else "down"
+
+        volumes = [float(c[6]) for c in recent_candles]
+        avg_volume = sum(volumes) / len(volumes)
+        latest_volume = volumes[-1]
+        volume_ratio = latest_volume / avg_volume if avg_volume > 0 else 1.0
+
+        return {
+            "momentum_pct": momentum_pct,
+            "direction": direction,
+            "price_now": price_now,
+            "price_then": price_then,
+            "avg_volume": avg_volume,
+            "latest_volume": latest_volume,
+            "volume_ratio": volume_ratio,
+            "candles": len(recent_candles),
+        }
+    except (IndexError, ValueError, KeyError, TypeError) as e:
+        print(f"  ⚠️  Kraken data parsing error: {e}", file=sys.stderr, flush=True)
+        return None
+
+
+KRAKEN_PAIRS = {
+    "BTC": "XXBTZUSD",
+    "ETH": "XETHZUSD",
+    "SOL": "SOLUSD",
+}
+
+
 def get_momentum(asset="BTC", source="binance", lookback=5):
     """Get price momentum from configured source."""
     if source == "binance":
         symbol = ASSET_SYMBOLS.get(asset, "BTCUSDT")
         return get_binance_momentum(symbol, lookback)
+    elif source == "kraken":
+        pair = KRAKEN_PAIRS.get(asset, "XXBTZUSD")
+        return get_kraken_momentum(pair, lookback)
     elif source == "coingecko":
         cg_id = COINGECKO_ASSETS.get(asset, "bitcoin")
         return get_coingecko_momentum(cg_id, lookback)
