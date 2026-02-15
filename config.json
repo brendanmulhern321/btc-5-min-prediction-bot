@@ -5,7 +5,7 @@
   "lookback_minutes": 5,
   "min_time_remaining": 60,
   "asset": "BTC",
-  "window": "15m",
+  "window": "5m",
   "signal_source": "kraken",
   "volume_confidence": true
 }

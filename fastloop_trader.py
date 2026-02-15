@@ -224,6 +224,13 @@ def discover_fast_market_markets(asset="BTC", window="5m", api_key=None):
                     continue
                 if m.get("status") != "active":
                     continue
+                # Filter by window: 5m markets have "HH:MM-HH:MM" pattern
+                import re
+                question_raw = m.get("question", "")
+                if window == "5m" and not re.search(r'\d{1,2}:\d{2}[AP]M\s*-\s*\d{1,2}:\d{2}[AP]M', question_raw):
+                    continue
+                if window == "15m" and not re.search(r'\d{1,2}:\d{2}[AP]M\s*-\s*\d{1,2}:\d{2}[AP]M', question_raw):
+                    continue
                 # Parse end time from resolves_at or question
                 end_time = None
                 resolves_at = m.get("resolves_at", "")
