@@ -302,20 +302,30 @@ def discover_fast_market_markets(asset="BTC", window="5m", api_key=None):
                     "fee_rate_bps": 0,
                 })
 
-    # Step 2: Check if we have a market expiring within 10 minutes
+    # Step 2: If no near market on Simmer, add a placeholder for the current
+    # window so the bot can check the signal. Import only happens at trade time.
     has_near_market = any(
         m.get("end_time") and MIN_TIME_REMAINING < (m["end_time"] - now_utc).total_seconds() <= 600
         for m in markets
     )
-
-    # Step 3: If no near market, try importing current windows (uses daily quota)
-    if not has_near_market and window == "5m" and api_key:
-        live_markets = _import_current_5m_markets(asset, api_key)
-        for m in live_markets:
-            mid = m.get("simmer_market_id", "")
-            if mid and mid not in seen_ids:
-                seen_ids.add(mid)
-                markets.append(m)
+    if not has_near_market and window == "5m":
+        now_et = now_utc - timedelta(hours=5)
+        minute = (now_et.minute // 5) * 5
+        ws = now_et.replace(minute=minute, second=0, microsecond=0) + timedelta(minutes=5)
+        we = ws + timedelta(minutes=5)
+        start_unix = int((ws + timedelta(hours=5)).replace(tzinfo=timezone.utc).timestamp())
+        end_time = (we + timedelta(hours=5)).replace(tzinfo=timezone.utc)
+        slug = f"{asset.lower()}-updown-5m-{start_unix}"
+        markets.append({
+            "question": f"{asset} Up or Down - {ws.strftime('%B %d')}, {ws.strftime('%I:%M%p')}-{we.strftime('%I:%M%p')} ET",
+            "slug": slug,
+            "simmer_market_id": "",  # no ID — will import only on trade signal
+            "condition_id": "",
+            "end_time": end_time,
+            "outcomes": ["Yes", "No"],
+            "outcome_prices": json.dumps(["0.5", "0.5"]),
+            "fee_rate_bps": 0,
+        })
 
     return markets
 
