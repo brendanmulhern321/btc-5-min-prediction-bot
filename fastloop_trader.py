@@ -876,6 +876,15 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"  ✅ Signal: {side.upper()} — {trade_rationale}{vol_note}", force=True)
     log(f"  Divergence: {divergence:.3f}", force=True)
 
+    # Re-check market is still current before trading
+    if end_time:
+        remaining_now = (end_time - datetime.now(timezone.utc)).total_seconds()
+        if remaining_now < MIN_TIME_REMAINING:
+            log(f"  ⏸️  Market expired during analysis ({remaining_now:.0f}s left < {MIN_TIME_REMAINING}s min) — skip", force=True)
+            if not quiet:
+                print(f"📊 Summary: No trade (market no longer current)")
+            return
+
     # Step 5: Import & Trade
     market_id = best.get("simmer_market_id", "")
     if market_id:
