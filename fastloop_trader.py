@@ -293,7 +293,11 @@ def get_binance_momentum(symbol="BTCUSDT", lookback_minutes=5):
         f"?symbol={symbol}&interval=1m&limit={lookback_minutes}"
     )
     result = _api_request(url)
-    if not result or isinstance(result, dict):
+    if not result:
+        log("  ⚠️  Binance API returned empty response", force=True)
+        return None
+    if isinstance(result, dict) and "error" in result:
+        log(f"  ⚠️  Binance API error: {result.get('error')}", force=True)
         return None
 
     try:
@@ -332,7 +336,11 @@ def get_coingecko_momentum(asset="bitcoin", lookback_minutes=5):
     """Fallback: get price from CoinGecko (less accurate, ~1-2 min lag)."""
     url = f"https://api.coingecko.com/api/v3/simple/price?ids={asset}&vs_currencies=usd"
     result = _api_request(url)
-    if not result or isinstance(result, dict) and result.get("error"):
+    if not result:
+        log("  ⚠️  CoinGecko API returned empty response", force=True)
+        return None
+    if isinstance(result, dict) and result.get("error"):
+        log(f"  ⚠️  CoinGecko API error: {result.get('error')}", force=True)
         return None
     price_now = result.get(asset, {}).get("usd")
     if not price_now:
