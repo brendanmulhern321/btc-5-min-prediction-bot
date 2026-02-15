@@ -20,6 +20,7 @@ import sys
 import json
 import math
 import argparse
+import time
 from datetime import datetime, timezone, timedelta
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
@@ -773,6 +774,8 @@ if __name__ == "__main__":
     parser.add_argument("--smart-sizing", action="store_true", help="Use portfolio-based position sizing")
     parser.add_argument("--quiet", "-q", action="store_true",
                         help="Only output on trades/errors (ideal for high-frequency runs)")
+    parser.add_argument("--loop", type=int, metavar="SECONDS", default=0,
+                        help="Run continuously with SECONDS interval between checks (0 = run once)")
     args = parser.parse_args()
 
     if args.set:
@@ -802,10 +805,33 @@ if __name__ == "__main__":
 
     dry_run = not args.live
 
-    run_fast_market_strategy(
-        dry_run=dry_run,
-        positions_only=args.positions,
-        show_config=args.config,
-        smart_sizing=args.smart_sizing,
-        quiet=args.quiet,
-    )
+    if args.loop > 0:
+        # Continuous mode - run every N seconds
+        print(f"🔄 Loop mode: running every {args.loop} seconds (Ctrl+C to stop)\n", flush=True)
+        while True:
+            try:
+                run_fast_market_strategy(
+                    dry_run=dry_run,
+                    positions_only=args.positions,
+                    show_config=args.config,
+                    smart_sizing=args.smart_sizing,
+                    quiet=args.quiet,
+                )
+                print(f"\n⏳ Sleeping {args.loop} seconds...\n", flush=True)
+                time.sleep(args.loop)
+            except KeyboardInterrupt:
+                print("\n\n👋 Loop stopped by user", flush=True)
+                sys.exit(0)
+            except Exception as e:
+                print(f"\n❌ Error in loop: {e}", file=sys.stderr, flush=True)
+                print(f"⏳ Sleeping {args.loop} seconds before retry...\n", flush=True)
+                time.sleep(args.loop)
+    else:
+        # One-shot mode
+        run_fast_market_strategy(
+            dry_run=dry_run,
+            positions_only=args.positions,
+            show_config=args.config,
+            smart_sizing=args.smart_sizing,
+            quiet=args.quiet,
+        )
