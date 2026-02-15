@@ -316,10 +316,20 @@ def discover_fast_market_markets(asset="BTC", window="5m", api_key=None):
         start_unix = int((ws + timedelta(hours=5)).replace(tzinfo=timezone.utc).timestamp())
         end_time = (we + timedelta(hours=5)).replace(tzinfo=timezone.utc)
         slug = f"{asset.lower()}-updown-5m-{start_unix}"
+
+        # Check if this window already exists on Simmer (imported by another agent)
+        # Match by end_time since question format may vary
+        existing_id = ""
+        for m in markets:
+            m_end = m.get("end_time")
+            if m_end and abs((m_end - end_time).total_seconds()) < 60:
+                existing_id = m.get("simmer_market_id", "")
+                break
+
         markets.append({
             "question": f"{asset} Up or Down - {ws.strftime('%B %d')}, {ws.strftime('%I:%M%p')}-{we.strftime('%I:%M%p')} ET",
             "slug": slug,
-            "simmer_market_id": "",  # no ID — will import only on trade signal
+            "simmer_market_id": existing_id,
             "condition_id": "",
             "end_time": end_time,
             "outcomes": ["Yes", "No"],
