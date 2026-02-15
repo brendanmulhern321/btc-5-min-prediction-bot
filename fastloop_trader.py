@@ -166,7 +166,7 @@ def get_api_key():
     return key
 
 
-def _api_request(url, method="GET", data=None, headers=None, timeout=15):
+def _api_request(url, method="GET", data=None, headers=None, timeout=30):
     """Make an HTTP request. Returns parsed JSON or None on error."""
     try:
         req_headers = headers or {}
