@@ -647,6 +647,19 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     momentum_pct = abs(momentum["momentum_pct"])
     direction = momentum["direction"]
 
+    # Check for existing positions (only allow one position at a time)
+    if not dry_run:
+        existing_positions = get_positions(api_key)
+        if existing_positions:
+            fast_market_positions = [p for p in existing_positions
+                                    if "up or down" in (p.get("question", "") or "").lower()]
+            if fast_market_positions:
+                log(f"  ⏸️  Already have {len(fast_market_positions)} active fast market position(s) — skip")
+                if not quiet:
+                    for pos in fast_market_positions[:1]:  # Show first position
+                        print(f"📊 Summary: Existing position in '{pos.get('question', 'Unknown')[:50]}...'")
+                return
+
     # Check minimum momentum
     if momentum_pct < MIN_MOMENTUM_PCT:
         log(f"  ⏸️  Momentum {momentum_pct:.3f}% < minimum {MIN_MOMENTUM_PCT}% — skip")
