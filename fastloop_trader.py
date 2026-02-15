@@ -254,21 +254,13 @@ def _import_current_5m_markets(asset, api_key):
 
 
 def discover_fast_market_markets(asset="BTC", window="5m", api_key=None):
-    """Find active fast markets. For 5m, imports current markets directly."""
+    """Find active fast markets. Checks Simmer first, imports only if needed."""
     patterns = ASSET_PATTERNS.get(asset, ASSET_PATTERNS["BTC"])
     markets = []
     seen_ids = set()
+    now_utc = datetime.now(timezone.utc)
 
-    # For 5m: always import the current/next windows directly
-    if window == "5m" and api_key:
-        live_markets = _import_current_5m_markets(asset, api_key)
-        for m in live_markets:
-            mid = m.get("simmer_market_id", "")
-            if mid:
-                seen_ids.add(mid)
-            markets.append(m)
-
-    # Also check Simmer API for other imported markets
+    # Step 1: Check Simmer API for already-imported markets
     if api_key:
         result = simmer_request("/api/sdk/markets", api_key=api_key)
         if result and isinstance(result, dict) and "markets" in result:
@@ -309,6 +301,21 @@ def discover_fast_market_markets(asset="BTC", window="5m", api_key=None):
                     "outcome_prices": json.dumps([str(yes_price), str(no_price)]),
                     "fee_rate_bps": 0,
                 })
+
+    # Step 2: Check if we have a market expiring within 10 minutes
+    has_near_market = any(
+        m.get("end_time") and MIN_TIME_REMAINING < (m["end_time"] - now_utc).total_seconds() <= 600
+        for m in markets
+    )
+
+    # Step 3: If no near market, try importing current windows (uses daily quota)
+    if not has_near_market and window == "5m" and api_key:
+        live_markets = _import_current_5m_markets(asset, api_key)
+        for m in live_markets:
+            mid = m.get("simmer_market_id", "")
+            if mid and mid not in seen_ids:
+                seen_ids.add(mid)
+                markets.append(m)
 
     return markets
 
