@@ -805,7 +805,8 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         existing_positions = get_positions(api_key)
         if existing_positions:
             fast_market_positions = [p for p in existing_positions
-                                    if "up or down" in (p.get("question", "") or "").lower()]
+                                    if "up or down" in (p.get("question", "") or "").lower()
+                                    and not p.get("redeemable")]
             if fast_market_positions:
                 log(f"  ⏸️  Already have {len(fast_market_positions)} active fast market position(s) — skip")
                 if not quiet:
