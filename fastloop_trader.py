@@ -59,6 +59,8 @@ CONFIG_SCHEMA = {
                          "help": "Minutes of price history for momentum calc"},
     "min_time_remaining": {"default": 60, "env": "SIMMER_SPRINT_MIN_TIME", "type": int,
                            "help": "Skip fast_markets with less than this many seconds remaining"},
+    "max_time_remaining": {"default": 600, "env": "SIMMER_SPRINT_MAX_TIME", "type": int,
+                           "help": "Skip fast_markets with more than this many seconds remaining"},
     "asset": {"default": "BTC", "env": "SIMMER_SPRINT_ASSET", "type": str,
               "help": "Asset to trade (BTC, ETH, SOL)"},
     "window": {"default": "5m", "env": "SIMMER_SPRINT_WINDOW", "type": str,
@@ -146,6 +148,7 @@ MAX_POSITION_USD = cfg["max_position"]
 SIGNAL_SOURCE = cfg["signal_source"]
 LOOKBACK_MINUTES = cfg["lookback_minutes"]
 MIN_TIME_REMAINING = cfg["min_time_remaining"]
+MAX_TIME_REMAINING = cfg["max_time_remaining"]
 ASSET = cfg["asset"].upper()
 WINDOW = cfg["window"]  # "5m" or "15m"
 VOLUME_CONFIDENCE = cfg["volume_confidence"]
@@ -271,7 +274,7 @@ def find_best_fast_market(markets):
         if not end_time:
             continue
         remaining = (end_time - now).total_seconds()
-        if remaining > MIN_TIME_REMAINING:
+        if MIN_TIME_REMAINING < remaining <= MAX_TIME_REMAINING:
             candidates.append((remaining, m))
 
     if not candidates:
@@ -556,6 +559,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"  Signal source:    {SIGNAL_SOURCE}")
     log(f"  Lookback:         {LOOKBACK_MINUTES} minutes")
     log(f"  Min time left:    {MIN_TIME_REMAINING}s")
+    log(f"  Max time left:    {MAX_TIME_REMAINING}s")
     log(f"  Volume weighting: {'✓' if VOLUME_CONFIDENCE else '✗'}")
 
     if show_config:
@@ -603,9 +607,9 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     # Step 2: Find best fast_market to trade
     best = find_best_fast_market(markets)
     if not best:
-        log(f"  No fast_markets with >{MIN_TIME_REMAINING}s remaining")
+        log(f"  No fast_markets with {MIN_TIME_REMAINING}s-{MAX_TIME_REMAINING}s remaining")
         if not quiet:
-            print("📊 Summary: No tradeable fast_markets (too close to expiry)")
+            print("📊 Summary: No tradeable fast_markets (none in time window)")
         return
 
     end_time = best.get("end_time")
