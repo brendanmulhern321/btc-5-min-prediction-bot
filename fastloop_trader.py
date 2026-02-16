@@ -82,6 +82,26 @@ ASSET_SYMBOLS = {
     "SOL": "SOLUSDT",
 }
 
+# Discord webhook for trade notifications
+DISCORD_WEBHOOK_URL = os.environ.get(
+    "DISCORD_WEBHOOK_URL",
+    "https://discord.com/api/webhooks/1463731362619064524/oNnCWiJ4fKO5ZkGovFATxvPpDvmNO-fNVuBdKnWOgXEC36zpA4XlVeb1jcyWUnt7bzs8"
+)
+
+
+def send_discord_notification(message):
+    """Send a notification to Discord via webhook."""
+    if not DISCORD_WEBHOOK_URL:
+        return
+    try:
+        data = json.dumps({"content": message}).encode("utf-8")
+        req = Request(DISCORD_WEBHOOK_URL, data=data, method="POST",
+                      headers={"Content-Type": "application/json"})
+        urlopen(req, timeout=10)
+    except Exception as e:
+        print(f"  ⚠️  Discord notification failed: {e}", file=sys.stderr, flush=True)
+
+
 # Asset → Gamma API search patterns
 ASSET_PATTERNS = {
     "BTC": ["bitcoin up or down"],
@@ -684,6 +704,17 @@ def redeem_resolved_positions(api_key, log_fn=None):
         if result and not result.get("error"):
             log_fn(f"  Redeemed successfully")
             redeemed += 1
+            # Discord notification — trade exit / resolution
+            pnl = pos.get("pnl", None)
+            shares_yes = pos.get("shares_yes", 0)
+            shares_no = pos.get("shares_no", 0)
+            pnl_str = f" | P&L: ${pnl:+.2f}" if pnl is not None else ""
+            send_discord_notification(
+                f"🏁 **TRADE RESOLVED**\n"
+                f"Market: {question}\n"
+                f"Result: Redeemed **{side.upper()}** side{pnl_str}\n"
+                f"Shares: YES {shares_yes:.1f} | NO {shares_no:.1f}"
+            )
         else:
             error = result.get("error", "Unknown") if result else "No response"
             log_fn(f"  Redeem failed: {error}")
@@ -903,6 +934,15 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
             shares = result.get("shares_bought") or result.get("shares") or 0
             trade_id = result.get("trade_id")
             log(f"  ✅ Bought {shares:.1f} {side.upper()} shares @ ${price:.3f}", force=True)
+
+            # Discord notification — trade entry
+            send_discord_notification(
+                f"🟢 **TRADE ENTRY | {asset}**\n"
+                f"Bought {shares:.1f} {side.upper()} shares @ ${price:.3f}\n"
+                f"Market: {best['question']}\n"
+                f"Signal: {direction} {momentum['momentum_pct']:+.3f}% momentum | Volume {momentum['volume_ratio']:.1f}x avg\n"
+                f"Size: ${position_size:.2f} | Expires in {remaining:.0f}s"
+            )
 
             # Log to trade journal
             if trade_id and JOURNAL_AVAILABLE:
