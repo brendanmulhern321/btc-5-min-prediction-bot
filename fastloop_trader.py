@@ -83,10 +83,7 @@ ASSET_SYMBOLS = {
 }
 
 # Discord webhook for trade notifications
-DISCORD_WEBHOOK_URL = os.environ.get(
-    "DISCORD_WEBHOOK_URL",
-    "https://discord.com/api/webhooks/1473076945120919704/NfnsIdHIFOoyQu9gN-jOa95x6xMI1oIMByK15130jnNmPos49hfsSucV_p5Mz-GCpesY"
-)
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
 
 def send_discord_notification(message):
