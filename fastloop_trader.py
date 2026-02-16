@@ -328,7 +328,7 @@ def discover_fast_market_markets(asset="BTC", window="5m", api_key=None):
     # Step 2: If no near market on Simmer, eagerly import from Polymarket.
     # Try the current and next window to maximise chance of finding a live market.
     has_near_market = any(
-        m.get("end_time") and MIN_TIME_REMAINING < (m["end_time"] - now_utc).total_seconds() <= 600
+        m.get("end_time") and MIN_TIME_REMAINING < (m["end_time"] - now_utc).total_seconds() <= 300
         for m in markets
     )
     if not has_near_market and window == "5m" and api_key:
@@ -827,7 +827,7 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
 
     # Volume confidence adjustment
     vol_note = ""
-    if VOLUME_CONFIDENCE and momentum["volume_ratio"] < 0.5:
+    if VOLUME_CONFIDENCE and momentum["volume_ratio"] < 0.05:
         log(f"  ⏸️  Low volume ({momentum['volume_ratio']:.2f}x avg) — weak signal, skip")
         if not quiet:
             print(f"📊 {asset} Summary: No trade (low volume)")
