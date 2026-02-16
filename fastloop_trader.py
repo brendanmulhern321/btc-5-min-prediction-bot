@@ -70,7 +70,7 @@ CONFIG_SCHEMA = {
 }
 
 TRADE_SOURCE = "sdk:fastloop"
-SMART_SIZING_PCT = 0.25  # 25% of balance per trade
+SMART_SIZING_PCT = 0.50  # 50% of balance per trade
 MIN_SHARES_PER_ORDER = 5  # Polymarket minimum
 
 # Asset → Binance symbol mapping
