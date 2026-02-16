@@ -2,8 +2,8 @@
 """
 Simmer FastLoop Trading Skill
 
-Trades Polymarket BTC 5-minute fast markets using CEX price momentum.
-Default signal: Binance BTCUSDT candles. Agents can customize signal source.
+Trades Polymarket 5-minute fast markets (BTC, ETH, etc.) using CEX price momentum.
+Supports multiple assets with max one position per asset at a time.
 
 Usage:
     python fast_trader.py              # Dry run (show opportunities, no trades)
@@ -61,8 +61,10 @@ CONFIG_SCHEMA = {
                            "help": "Skip fast_markets with less than this many seconds remaining"},
     "max_time_remaining": {"default": 86400, "env": "SIMMER_SPRINT_MAX_TIME", "type": int,
                            "help": "Skip fast_markets with more than this many seconds remaining"},
-    "asset": {"default": "BTC", "env": "SIMMER_SPRINT_ASSET", "type": str,
-              "help": "Asset to trade (BTC, ETH, SOL)"},
+    "assets": {"default": ["BTC"], "env": "SIMMER_SPRINT_ASSETS", "type": list,
+               "help": "Assets to trade, e.g. ['BTC', 'ETH']"},
+    "asset": {"default": "", "env": "SIMMER_SPRINT_ASSET", "type": str,
+              "help": "(Deprecated) Single asset — use 'assets' list instead"},
     "window": {"default": "5m", "env": "SIMMER_SPRINT_WINDOW", "type": str,
                "help": "Market window duration (5m or 15m)"},
     "volume_confidence": {"default": True, "env": "SIMMER_SPRINT_VOL_CONF", "type": bool,
@@ -87,6 +89,13 @@ ASSET_PATTERNS = {
     "SOL": ["solana up or down"],
 }
 
+# Asset → keyword for matching positions (lowercase)
+ASSET_KEYWORDS = {
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "SOL": "solana",
+}
+
 
 def _load_config(schema, skill_file, config_filename="config.json"):
     """Load config with priority: config.json > env vars > defaults."""
@@ -109,6 +118,8 @@ def _load_config(schema, skill_file, config_filename="config.json"):
             try:
                 if type_fn == bool:
                     result[key] = val.lower() in ("true", "1", "yes")
+                elif type_fn == list:
+                    result[key] = [v.strip() for v in val.split(",")]
                 else:
                     result[key] = type_fn(val)
             except (ValueError, TypeError):
@@ -149,7 +160,16 @@ SIGNAL_SOURCE = cfg["signal_source"]
 LOOKBACK_MINUTES = cfg["lookback_minutes"]
 MIN_TIME_REMAINING = cfg["min_time_remaining"]
 MAX_TIME_REMAINING = cfg["max_time_remaining"]
-ASSET = cfg["asset"].upper()
+# Build ASSETS list: prefer "assets" key, fall back to deprecated "asset" key
+_assets_cfg = cfg.get("assets", [])
+_asset_single = cfg.get("asset", "")
+if _assets_cfg and isinstance(_assets_cfg, list) and len(_assets_cfg) > 0:
+    ASSETS = [a.upper() for a in _assets_cfg]
+elif _asset_single:
+    ASSETS = [_asset_single.upper()]
+else:
+    ASSETS = ["BTC"]
+ASSET = ASSETS[0]  # backward compat: primary asset for logging
 WINDOW = cfg["window"]  # "5m" or "15m"
 VOLUME_CONFIDENCE = cfg["volume_confidence"]
 
@@ -694,9 +714,223 @@ def calculate_position_size(api_key, max_size, smart_sizing=False):
 # Main Strategy Logic
 # =============================================================================
 
+def _has_active_position_for_asset(asset, positions, now_utc):
+    """Check if there's already an active fast market position for this specific asset.
+    Returns the matching position (or None)."""
+    keyword = ASSET_KEYWORDS.get(asset, asset.lower())
+    for p in positions:
+        q = (p.get("question", "") or "").lower()
+        if "up or down" not in q:
+            continue
+        if keyword not in q:
+            continue  # different asset
+        if p.get("redeemable"):
+            continue
+        pos_end = _parse_fast_market_end_time(p.get("question", ""))
+        if pos_end and pos_end < now_utc:
+            continue  # market already ended
+        return p
+    return None
+
+
+def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
+    """Run one cycle of the fast_market trading strategy for a single asset.
+    Returns True if a trade was executed/attempted, False otherwise."""
+
+    # Step 1: Discover fast markets for this asset
+    log(f"\n🔍 Discovering {asset} fast markets...")
+    markets = discover_fast_market_markets(asset, WINDOW, api_key=api_key)
+    log(f"  Found {len(markets)} active fast markets")
+
+    if not markets:
+        log("  No active fast markets found")
+        return False
+
+    # Step 2: Find best fast_market to trade
+    best = find_best_fast_market(markets)
+    if not best:
+        log(f"  No fast_markets with {MIN_TIME_REMAINING}s-300s remaining")
+        return False
+
+    end_time = best.get("end_time")
+    remaining = (end_time - datetime.now(timezone.utc)).total_seconds() if end_time else 0
+    log(f"\n🎯 Selected: {best['question']}")
+    log(f"  Expires in: {remaining:.0f}s")
+
+    # Parse current market odds
+    try:
+        prices = json.loads(best.get("outcome_prices", "[]"))
+        market_yes_price = float(prices[0]) if prices else 0.5
+    except (json.JSONDecodeError, IndexError, ValueError):
+        market_yes_price = 0.5
+    log(f"  Current YES price: ${market_yes_price:.3f}")
+
+    # Fee info (fast markets charge 10% on winnings)
+    fee_rate_bps = best.get("fee_rate_bps", 0)
+    fee_rate = fee_rate_bps / 10000  # 1000 bps -> 0.10
+    if fee_rate > 0:
+        log(f"  Fee rate:         {fee_rate:.0%} (Polymarket fast market fee)")
+
+    # Step 3: Get CEX price momentum
+    log(f"\n📈 Fetching {asset} price signal ({SIGNAL_SOURCE})...")
+    momentum = get_momentum(asset, SIGNAL_SOURCE, LOOKBACK_MINUTES)
+
+    if not momentum:
+        log("  ❌ Failed to fetch price data", force=True)
+        return False
+
+    log(f"  Price: ${momentum['price_now']:,.2f} (was ${momentum['price_then']:,.2f})")
+    log(f"  Momentum: {momentum['momentum_pct']:+.3f}%")
+    log(f"  Direction: {momentum['direction']}")
+    if VOLUME_CONFIDENCE:
+        log(f"  Volume ratio: {momentum['volume_ratio']:.2f}x avg")
+
+    # Step 4: Decision logic
+    log(f"\n🧠 Analyzing {asset}...")
+
+    momentum_pct = abs(momentum["momentum_pct"])
+    direction = momentum["direction"]
+
+    # Check for existing position for THIS ASSET only (allow one position per asset)
+    if not dry_run:
+        existing_positions = get_positions(api_key)
+        if existing_positions:
+            now_check = datetime.now(timezone.utc)
+            existing = _has_active_position_for_asset(asset, existing_positions, now_check)
+            if existing:
+                log(f"  ⏸️  Already have an active {asset} position — skip")
+                if not quiet:
+                    print(f"📊 {asset} Summary: Existing position in '{existing.get('question', 'Unknown')[:50]}...'")
+                return False
+
+    # Check minimum momentum
+    if momentum_pct < MIN_MOMENTUM_PCT:
+        log(f"  ⏸️  Momentum {momentum_pct:.3f}% < minimum {MIN_MOMENTUM_PCT}% — skip")
+        if not quiet:
+            print(f"📊 {asset} Summary: No trade (momentum too weak: {momentum_pct:.3f}%)")
+        return False
+
+    # Calculate expected fair price based on momentum direction
+    if direction == "up":
+        side = "yes"
+        divergence = 0.50 + ENTRY_THRESHOLD - market_yes_price
+        trade_rationale = f"{asset} up {momentum['momentum_pct']:+.3f}% but YES only ${market_yes_price:.3f}"
+    else:
+        side = "no"
+        divergence = market_yes_price - (0.50 - ENTRY_THRESHOLD)
+        trade_rationale = f"{asset} down {momentum['momentum_pct']:+.3f}% but YES still ${market_yes_price:.3f}"
+
+    # Volume confidence adjustment
+    vol_note = ""
+    if VOLUME_CONFIDENCE and momentum["volume_ratio"] < 0.5:
+        log(f"  ⏸️  Low volume ({momentum['volume_ratio']:.2f}x avg) — weak signal, skip")
+        if not quiet:
+            print(f"📊 {asset} Summary: No trade (low volume)")
+        return False
+    elif VOLUME_CONFIDENCE and momentum["volume_ratio"] > 2.0:
+        vol_note = f" 📊 (high volume: {momentum['volume_ratio']:.1f}x avg)"
+
+    # Check divergence threshold
+    if divergence <= 0:
+        log(f"  ⏸️  Market already priced in: divergence {divergence:.3f} ≤ 0 — skip")
+        if not quiet:
+            print(f"📊 {asset} Summary: No trade (market already priced in)")
+        return False
+
+    # Fee-aware EV check: require enough divergence to cover fees
+    if fee_rate > 0:
+        buy_price = market_yes_price if side == "yes" else (1 - market_yes_price)
+        win_profit = (1 - buy_price) * (1 - fee_rate)
+        breakeven = buy_price / (win_profit + buy_price)
+        fee_penalty = breakeven - 0.50
+        min_divergence = fee_penalty + 0.02
+        log(f"  Breakeven:        {breakeven:.1%} win rate (fee-adjusted, min divergence {min_divergence:.3f})")
+        if divergence < min_divergence:
+            log(f"  ⏸️  Divergence {divergence:.3f} < fee-adjusted minimum {min_divergence:.3f} — skip")
+            if not quiet:
+                print(f"📊 {asset} Summary: No trade (fees eat the edge)")
+            return False
+
+    # We have a signal!
+    position_size = calculate_position_size(api_key, MAX_POSITION_USD, smart_sizing)
+    price = market_yes_price if side == "yes" else (1 - market_yes_price)
+
+    # Check minimum order size
+    if price > 0:
+        min_cost = MIN_SHARES_PER_ORDER * price
+        if min_cost > position_size:
+            log(f"  ⚠️  Position ${position_size:.2f} too small for {MIN_SHARES_PER_ORDER} shares at ${price:.2f}")
+            return False
+
+    log(f"  ✅ Signal: {side.upper()} — {trade_rationale}{vol_note}", force=True)
+    log(f"  Divergence: {divergence:.3f}", force=True)
+
+    # Re-check market is still current before trading
+    if end_time:
+        remaining_now = (end_time - datetime.now(timezone.utc)).total_seconds()
+        if remaining_now < MIN_TIME_REMAINING:
+            log(f"  ⏸️  Market expired during analysis ({remaining_now:.0f}s left < {MIN_TIME_REMAINING}s min) — skip", force=True)
+            if not quiet:
+                print(f"📊 {asset} Summary: No trade (market no longer current)")
+            return False
+
+    # Step 5: Import & Trade
+    market_id = best.get("simmer_market_id", "")
+    if market_id:
+        log(f"\n🔗 Using Simmer market: {market_id[:16]}...", force=True)
+    else:
+        log(f"\n🔗 Importing to Simmer...", force=True)
+        market_id, import_error = import_fast_market_market(api_key, best["slug"])
+        if not market_id:
+            log(f"  ❌ Import failed: {import_error}", force=True)
+            return False
+        log(f"  ✅ Market ID: {market_id[:16]}...", force=True)
+
+    result = None
+    if dry_run:
+        est_shares = position_size / price if price > 0 else 0
+        log(f"  [DRY RUN] Would buy {side.upper()} ${position_size:.2f} (~{est_shares:.1f} shares)", force=True)
+    else:
+        log(f"  Executing {side.upper()} trade for ${position_size:.2f}...", force=True)
+        result = execute_trade(api_key, market_id, side, position_size)
+
+        if result and result.get("success"):
+            shares = result.get("shares_bought") or result.get("shares") or 0
+            trade_id = result.get("trade_id")
+            log(f"  ✅ Bought {shares:.1f} {side.upper()} shares @ ${price:.3f}", force=True)
+
+            # Log to trade journal
+            if trade_id and JOURNAL_AVAILABLE:
+                confidence = min(0.9, 0.5 + divergence + (momentum_pct / 100))
+                log_trade(
+                    trade_id=trade_id,
+                    source=TRADE_SOURCE,
+                    thesis=trade_rationale,
+                    confidence=round(confidence, 2),
+                    asset=asset,
+                    momentum_pct=round(momentum["momentum_pct"], 3),
+                    volume_ratio=round(momentum["volume_ratio"], 2),
+                    signal_source=SIGNAL_SOURCE,
+                )
+        else:
+            error = result.get("error", "Unknown error") if result else "No response"
+            log(f"  ❌ Trade failed: {error}", force=True)
+
+    # Summary
+    total_trades = 0 if dry_run else (1 if result and result.get("success") else 0)
+    show_summary = not quiet or total_trades > 0
+    if show_summary:
+        print(f"\n📊 {asset} Summary:")
+        print(f"  Sprint: {best['question'][:50]}")
+        print(f"  Signal: {direction} {momentum_pct:.3f}% | YES ${market_yes_price:.3f}")
+        print(f"  Action: {'DRY RUN' if dry_run else ('TRADED' if total_trades else 'FAILED')}")
+
+    return total_trades > 0
+
+
 def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=False,
                         smart_sizing=False, quiet=False):
-    """Run one cycle of the fast_market trading strategy."""
+    """Run one cycle of the fast_market trading strategy for all configured assets."""
 
     def log(msg, force=False):
         """Print unless quiet mode is on. force=True always prints."""
@@ -710,7 +944,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         log("\n  [DRY RUN] No trades will be executed. Use --live to enable trading.")
 
     log(f"\n⚙️  Configuration:")
-    log(f"  Asset:            {ASSET}")
+    log(f"  Assets:           {', '.join(ASSETS)}")
     log(f"  Window:           {WINDOW}")
     log(f"  Entry threshold:  {ENTRY_THRESHOLD} (min divergence from 50¢)")
     log(f"  Min momentum:     {MIN_MOMENTUM_PCT}% (min price move)")
@@ -726,7 +960,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         log(f"\n  Config file: {config_path}")
         log(f"\n  To change settings:")
         log(f'    python fast_trader.py --set entry_threshold=0.08')
-        log(f'    python fast_trader.py --set asset=ETH')
+        log(f'    python fast_trader.py --set assets=BTC,ETH')
         log(f'    Or edit config.json directly')
         return
 
@@ -757,207 +991,11 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     if redeemed > 0:
         log(f"  Redeemed {redeemed} resolved position(s)")
 
-    # Step 1: Discover fast markets
-    log(f"\n🔍 Discovering {ASSET} fast markets...")
-    markets = discover_fast_market_markets(ASSET, WINDOW, api_key=api_key)
-    log(f"  Found {len(markets)} active fast markets")
-
-    if not markets:
-        log("  No active fast markets found")
-        if not quiet:
-            print("📊 Summary: No markets available")
-        return
-
-    # Step 2: Find best fast_market to trade
-    best = find_best_fast_market(markets)
-    if not best:
-        log(f"  No fast_markets with {MIN_TIME_REMAINING}s-300s remaining")
-        if not quiet:
-            print("📊 Summary: No tradeable fast_markets (none in time window)")
-        return
-
-    end_time = best.get("end_time")
-    remaining = (end_time - datetime.now(timezone.utc)).total_seconds() if end_time else 0
-    log(f"\n🎯 Selected: {best['question']}")
-    log(f"  Expires in: {remaining:.0f}s")
-
-    # Parse current market odds
-    try:
-        prices = json.loads(best.get("outcome_prices", "[]"))
-        market_yes_price = float(prices[0]) if prices else 0.5
-    except (json.JSONDecodeError, IndexError, ValueError):
-        market_yes_price = 0.5
-    log(f"  Current YES price: ${market_yes_price:.3f}")
-
-    # Fee info (fast markets charge 10% on winnings)
-    fee_rate_bps = best.get("fee_rate_bps", 0)
-    fee_rate = fee_rate_bps / 10000  # 1000 bps -> 0.10
-    if fee_rate > 0:
-        log(f"  Fee rate:         {fee_rate:.0%} (Polymarket fast market fee)")
-
-    # Step 3: Get CEX price momentum
-    log(f"\n📈 Fetching {ASSET} price signal ({SIGNAL_SOURCE})...")
-    momentum = get_momentum(ASSET, SIGNAL_SOURCE, LOOKBACK_MINUTES)
-
-    if not momentum:
-        log("  ❌ Failed to fetch price data", force=True)
-        return
-
-    log(f"  Price: ${momentum['price_now']:,.2f} (was ${momentum['price_then']:,.2f})")
-    log(f"  Momentum: {momentum['momentum_pct']:+.3f}%")
-    log(f"  Direction: {momentum['direction']}")
-    if VOLUME_CONFIDENCE:
-        log(f"  Volume ratio: {momentum['volume_ratio']:.2f}x avg")
-
-    # Step 4: Decision logic
-    log(f"\n🧠 Analyzing...")
-
-    momentum_pct = abs(momentum["momentum_pct"])
-    direction = momentum["direction"]
-
-    # Check for existing positions (only allow one position at a time)
-    if not dry_run:
-        existing_positions = get_positions(api_key)
-        if existing_positions:
-            now_check = datetime.now(timezone.utc)
-            fast_market_positions = []
-            for p in existing_positions:
-                if "up or down" not in (p.get("question", "") or "").lower():
-                    continue
-                if p.get("redeemable"):
-                    continue
-                pos_end = _parse_fast_market_end_time(p.get("question", ""))
-                if pos_end and pos_end < now_check:
-                    continue  # market already ended (resolved loss)
-                fast_market_positions.append(p)
-            if fast_market_positions:
-                log(f"  ⏸️  Already have {len(fast_market_positions)} active fast market position(s) — skip")
-                if not quiet:
-                    for pos in fast_market_positions[:1]:  # Show first position
-                        print(f"📊 Summary: Existing position in '{pos.get('question', 'Unknown')[:50]}...'")
-                return
-
-    # Check minimum momentum
-    if momentum_pct < MIN_MOMENTUM_PCT:
-        log(f"  ⏸️  Momentum {momentum_pct:.3f}% < minimum {MIN_MOMENTUM_PCT}% — skip")
-        if not quiet:
-            print(f"📊 Summary: No trade (momentum too weak: {momentum_pct:.3f}%)")
-        return
-
-    # Calculate expected fair price based on momentum direction
-    # Simple model: strong momentum → higher probability of continuation
-    if direction == "up":
-        side = "yes"
-        divergence = 0.50 + ENTRY_THRESHOLD - market_yes_price
-        trade_rationale = f"{ASSET} up {momentum['momentum_pct']:+.3f}% but YES only ${market_yes_price:.3f}"
-    else:
-        side = "no"
-        divergence = market_yes_price - (0.50 - ENTRY_THRESHOLD)
-        trade_rationale = f"{ASSET} down {momentum['momentum_pct']:+.3f}% but YES still ${market_yes_price:.3f}"
-
-    # Volume confidence adjustment
-    vol_note = ""
-    if VOLUME_CONFIDENCE and momentum["volume_ratio"] < 0.5:
-        log(f"  ⏸️  Low volume ({momentum['volume_ratio']:.2f}x avg) — weak signal, skip")
-        if not quiet:
-            print(f"📊 Summary: No trade (low volume)")
-        return
-    elif VOLUME_CONFIDENCE and momentum["volume_ratio"] > 2.0:
-        vol_note = f" 📊 (high volume: {momentum['volume_ratio']:.1f}x avg)"
-
-    # Check divergence threshold
-    if divergence <= 0:
-        log(f"  ⏸️  Market already priced in: divergence {divergence:.3f} ≤ 0 — skip")
-        if not quiet:
-            print(f"📊 Summary: No trade (market already priced in)")
-        return
-
-    # Fee-aware EV check: require enough divergence to cover fees
-    if fee_rate > 0:
-        buy_price = market_yes_price if side == "yes" else (1 - market_yes_price)
-        win_profit = (1 - buy_price) * (1 - fee_rate)
-        breakeven = buy_price / (win_profit + buy_price)
-        fee_penalty = breakeven - 0.50  # how much fees shift breakeven above 50%
-        min_divergence = fee_penalty + 0.02  # plus buffer
-        log(f"  Breakeven:        {breakeven:.1%} win rate (fee-adjusted, min divergence {min_divergence:.3f})")
-        if divergence < min_divergence:
-            log(f"  ⏸️  Divergence {divergence:.3f} < fee-adjusted minimum {min_divergence:.3f} — skip")
-            if not quiet:
-                print(f"📊 Summary: No trade (fees eat the edge)")
-            return
-
-    # We have a signal!
-    position_size = calculate_position_size(api_key, MAX_POSITION_USD, smart_sizing)
-    price = market_yes_price if side == "yes" else (1 - market_yes_price)
-
-    # Check minimum order size
-    if price > 0:
-        min_cost = MIN_SHARES_PER_ORDER * price
-        if min_cost > position_size:
-            log(f"  ⚠️  Position ${position_size:.2f} too small for {MIN_SHARES_PER_ORDER} shares at ${price:.2f}")
-            return
-
-    log(f"  ✅ Signal: {side.upper()} — {trade_rationale}{vol_note}", force=True)
-    log(f"  Divergence: {divergence:.3f}", force=True)
-
-    # Re-check market is still current before trading
-    if end_time:
-        remaining_now = (end_time - datetime.now(timezone.utc)).total_seconds()
-        if remaining_now < MIN_TIME_REMAINING:
-            log(f"  ⏸️  Market expired during analysis ({remaining_now:.0f}s left < {MIN_TIME_REMAINING}s min) — skip", force=True)
-            if not quiet:
-                print(f"📊 Summary: No trade (market no longer current)")
-            return
-
-    # Step 5: Import & Trade
-    market_id = best.get("simmer_market_id", "")
-    if market_id:
-        log(f"\n🔗 Using Simmer market: {market_id[:16]}...", force=True)
-    else:
-        log(f"\n🔗 Importing to Simmer...", force=True)
-        market_id, import_error = import_fast_market_market(api_key, best["slug"])
-        if not market_id:
-            log(f"  ❌ Import failed: {import_error}", force=True)
-            return
-        log(f"  ✅ Market ID: {market_id[:16]}...", force=True)
-
-    if dry_run:
-        est_shares = position_size / price if price > 0 else 0
-        log(f"  [DRY RUN] Would buy {side.upper()} ${position_size:.2f} (~{est_shares:.1f} shares)", force=True)
-    else:
-        log(f"  Executing {side.upper()} trade for ${position_size:.2f}...", force=True)
-        result = execute_trade(api_key, market_id, side, position_size)
-
-        if result and result.get("success"):
-            shares = result.get("shares_bought") or result.get("shares") or 0
-            trade_id = result.get("trade_id")
-            log(f"  ✅ Bought {shares:.1f} {side.upper()} shares @ ${price:.3f}", force=True)
-
-            # Log to trade journal
-            if trade_id and JOURNAL_AVAILABLE:
-                confidence = min(0.9, 0.5 + divergence + (momentum_pct / 100))
-                log_trade(
-                    trade_id=trade_id,
-                    source=TRADE_SOURCE,
-                    thesis=trade_rationale,
-                    confidence=round(confidence, 2),
-                    asset=ASSET,
-                    momentum_pct=round(momentum["momentum_pct"], 3),
-                    volume_ratio=round(momentum["volume_ratio"], 2),
-                    signal_source=SIGNAL_SOURCE,
-                )
-        else:
-            error = result.get("error", "Unknown error") if result else "No response"
-            log(f"  ❌ Trade failed: {error}", force=True)
-
-    # Summary
-    total_trades = 0 if dry_run else (1 if result and result.get("success") else 0)
-    show_summary = not quiet or total_trades > 0
-    if show_summary:
-        print(f"\n📊 Summary:")
-        print(f"  Sprint: {best['question'][:50]}")
-        print(f"  Signal: {direction} {momentum_pct:.3f}% | YES ${market_yes_price:.3f}")
-        print(f"  Action: {'DRY RUN' if dry_run else ('TRADED' if total_trades else 'FAILED')}")
+    # Run strategy for each configured asset (max 1 position per asset)
+    for asset in ASSETS:
+        log(f"\n{'─' * 40}")
+        log(f"  Processing {asset}...")
+        _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log)
 
 
 # =============================================================================
@@ -991,6 +1029,8 @@ if __name__ == "__main__":
                 try:
                     if type_fn == bool:
                         updates[key] = val.lower() in ("true", "1", "yes")
+                    elif type_fn == list:
+                        updates[key] = [v.strip().upper() for v in val.split(",")]
                     else:
                         updates[key] = type_fn(val)
                 except ValueError:
