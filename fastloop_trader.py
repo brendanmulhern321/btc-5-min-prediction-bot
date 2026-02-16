@@ -312,12 +312,16 @@ def discover_fast_market_markets(asset="BTC", window="5m", api_key=None):
         for m in markets
     )
     if not has_near_market and window == "5m":
-        now_et = now_utc - timedelta(hours=5)
-        minute = (now_et.minute // 5) * 5
-        ws = now_et.replace(minute=minute, second=0, microsecond=0) + timedelta(minutes=5)
-        we = ws + timedelta(minutes=5)
-        start_unix = int((ws + timedelta(hours=5)).replace(tzinfo=timezone.utc).timestamp())
-        end_time = (we + timedelta(hours=5)).replace(tzinfo=timezone.utc)
+        # Calculate the CURRENT 5-minute window using UTC timestamps
+        now_ts = int(now_utc.timestamp())
+        current_window_start = (now_ts // 300) * 300
+        current_window_end = current_window_start + 300
+        ws_utc = datetime.fromtimestamp(current_window_start, tz=timezone.utc)
+        we_utc = datetime.fromtimestamp(current_window_end, tz=timezone.utc)
+        ws_et = ws_utc - timedelta(hours=5)
+        we_et = we_utc - timedelta(hours=5)
+        start_unix = current_window_start
+        end_time = we_utc
         slug = f"{asset.lower()}-updown-5m-{start_unix}"
 
         # Check if this window already exists on Simmer (imported by another agent)
@@ -330,7 +334,7 @@ def discover_fast_market_markets(asset="BTC", window="5m", api_key=None):
                 break
 
         markets.append({
-            "question": f"{asset} Up or Down - {ws.strftime('%B %d')}, {ws.strftime('%I:%M%p')}-{we.strftime('%I:%M%p')} ET",
+            "question": f"{asset} Up or Down - {ws_et.strftime('%B %d')}, {ws_et.strftime('%I:%M%p')}-{we_et.strftime('%I:%M%p')} ET",
             "slug": slug,
             "simmer_market_id": existing_id,
             "condition_id": "",
