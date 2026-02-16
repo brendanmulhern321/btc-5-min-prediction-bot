@@ -560,10 +560,12 @@ def get_kraken_momentum(pair="XXBTZUSD", lookback_minutes=5):
         momentum_pct = ((price_now - price_then) / price_then) * 100
         direction = "up" if momentum_pct > 0 else "down"
 
-        # Use ALL available candles for volume average (more stable for thin pairs)
-        all_volumes = [float(c[6]) for c in candles]
+        # Volume: use second-to-last candle (latest is still forming / incomplete)
+        # and average over all completed candles for a stable baseline
+        completed = candles[:-1]  # exclude incomplete last candle
+        all_volumes = [float(c[6]) for c in completed] if completed else [float(c[6]) for c in candles]
         avg_volume = sum(all_volumes) / len(all_volumes) if all_volumes else 0
-        latest_volume = float(recent_candles[-1][6])
+        latest_volume = float(recent_candles[-2][6]) if len(recent_candles) >= 2 else float(recent_candles[-1][6])
         volume_ratio = latest_volume / avg_volume if avg_volume > 0 else 1.0
 
         return {
