@@ -919,16 +919,14 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
                 print(f"📊 {asset} Summary: No trade (fees eat the edge)")
             return False
 
-    # We have a signal!
-    position_size = calculate_position_size(api_key, MAX_POSITION_USD, smart_sizing)
+    # We have a signal! Size to exactly 5 shares.
     price = market_yes_price if side == "yes" else (1 - market_yes_price)
+    target_shares = 5
+    position_size = round(target_shares * price, 2)
 
-    # Check minimum order size
-    if price > 0:
-        min_cost = MIN_SHARES_PER_ORDER * price
-        if min_cost > position_size:
-            log(f"  ⚠️  Position ${position_size:.2f} too small for {MIN_SHARES_PER_ORDER} shares at ${price:.2f}")
-            return False
+    if position_size < 0.01:
+        log(f"  ⚠️  Price ${price:.3f} too low to size 5 shares")
+        return False
 
     log(f"  ✅ Signal: {side.upper()} — {trade_rationale}{vol_note}", force=True)
     log(f"  Divergence: {divergence:.3f}", force=True)
