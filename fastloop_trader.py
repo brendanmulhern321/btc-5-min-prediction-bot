@@ -325,44 +325,46 @@ def discover_fast_market_markets(asset="BTC", window="5m", api_key=None):
                     "fee_rate_bps": 0,
                 })
 
-    # Step 2: If no near market on Simmer, add a placeholder for the current
-    # window so the bot can check the signal. Import only happens at trade time.
+    # Step 2: If no near market on Simmer, eagerly import from Polymarket.
+    # Try the current and next window to maximise chance of finding a live market.
     has_near_market = any(
         m.get("end_time") and MIN_TIME_REMAINING < (m["end_time"] - now_utc).total_seconds() <= 600
         for m in markets
     )
-    if not has_near_market and window == "5m":
-        # Calculate the CURRENT 5-minute window using UTC timestamps
+    if not has_near_market and window == "5m" and api_key:
         now_ts = int(now_utc.timestamp())
-        current_window_start = (now_ts // 300) * 300
-        current_window_end = current_window_start + 300
-        ws_utc = datetime.fromtimestamp(current_window_start, tz=timezone.utc)
-        we_utc = datetime.fromtimestamp(current_window_end, tz=timezone.utc)
-        ws_et = ws_utc - timedelta(hours=5)
-        we_et = we_utc - timedelta(hours=5)
-        start_unix = current_window_start
-        end_time = we_utc
-        slug = f"{asset.lower()}-updown-5m-{start_unix}"
-
-        # Check if this window already exists on Simmer (imported by another agent)
-        # Match by end_time since question format may vary
-        existing_id = ""
-        for m in markets:
-            m_end = m.get("end_time")
-            if m_end and abs((m_end - end_time).total_seconds()) < 60:
-                existing_id = m.get("simmer_market_id", "")
-                break
-
-        markets.append({
-            "question": f"{asset} Up or Down - {ws_et.strftime('%B %d')}, {ws_et.strftime('%I:%M%p')}-{we_et.strftime('%I:%M%p')} ET",
-            "slug": slug,
-            "simmer_market_id": existing_id,
-            "condition_id": "",
-            "end_time": end_time,
-            "outcomes": ["Yes", "No"],
-            "outcome_prices": json.dumps(["0.5", "0.5"]),
-            "fee_rate_bps": 0,
-        })
+        asset_lower = asset.lower()
+        for offset in range(2):  # current window, then next window
+            ws_ts = (now_ts // 300) * 300 + (300 * offset)
+            we_ts = ws_ts + 300
+            ws_utc = datetime.fromtimestamp(ws_ts, tz=timezone.utc)
+            we_utc = datetime.fromtimestamp(we_ts, tz=timezone.utc)
+            we_end = we_utc
+            # Skip if this window already exists
+            already = False
+            for m in markets:
+                m_end = m.get("end_time")
+                if m_end and abs((m_end - we_end).total_seconds()) < 60:
+                    already = True
+                    break
+            if already:
+                continue
+            slug = f"{asset_lower}-updown-5m-{ws_ts}"
+            market_id, err = import_fast_market_market(api_key, slug)
+            ws_et = ws_utc - timedelta(hours=5)
+            we_et = we_utc - timedelta(hours=5)
+            markets.append({
+                "question": f"{asset} Up or Down - {ws_et.strftime('%B %d')}, {ws_et.strftime('%I:%M%p')}-{we_et.strftime('%I:%M%p')} ET",
+                "slug": slug,
+                "simmer_market_id": market_id or "",
+                "condition_id": "",
+                "end_time": we_end,
+                "outcomes": ["Yes", "No"],
+                "outcome_prices": json.dumps(["0.5", "0.5"]),
+                "fee_rate_bps": 0,
+            })
+            if market_id:
+                break  # successfully imported, no need to try next window
 
     return markets
 
@@ -547,7 +549,7 @@ def get_kraken_momentum(pair="XXBTZUSD", lookback_minutes=5):
         if not candles or len(candles) < lookback_minutes:
             return None
 
-        # Take last N candles
+        # Take last N candles for momentum
         recent_candles = candles[-lookback_minutes:]
         if len(recent_candles) < 2:
             return None
@@ -558,9 +560,10 @@ def get_kraken_momentum(pair="XXBTZUSD", lookback_minutes=5):
         momentum_pct = ((price_now - price_then) / price_then) * 100
         direction = "up" if momentum_pct > 0 else "down"
 
-        volumes = [float(c[6]) for c in recent_candles]
-        avg_volume = sum(volumes) / len(volumes)
-        latest_volume = volumes[-1]
+        # Use ALL available candles for volume average (more stable for thin pairs)
+        all_volumes = [float(c[6]) for c in candles]
+        avg_volume = sum(all_volumes) / len(all_volumes) if all_volumes else 0
+        latest_volume = float(recent_candles[-1][6])
         volume_ratio = latest_volume / avg_volume if avg_volume > 0 else 1.0
 
         return {
