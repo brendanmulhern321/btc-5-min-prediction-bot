@@ -107,6 +107,13 @@ ASSET_PATTERNS = {
     "SOL": ["solana up or down"],
 }
 
+# Asset → market window (Polymarket only has 5m for BTC; ETH/SOL are 15m)
+ASSET_WINDOWS = {
+    "BTC": "5m",
+    "ETH": "15m",
+    "SOL": "15m",
+}
+
 # Asset → keyword for matching positions (lowercase)
 ASSET_KEYWORDS = {
     "BTC": "bitcoin",
@@ -259,6 +266,29 @@ def _is_5m_market(question):
     return 4 <= diff <= 6  # 5 minutes with tolerance
 
 
+def _is_15m_market(question):
+    """Check if question describes a 15-minute market window."""
+    import re
+    match = re.search(r'(\d{1,2}):(\d{2})(AM|PM)\s*-\s*(\d{1,2}):(\d{2})(AM|PM)', question)
+    if not match:
+        return False
+    h1, m1, p1 = int(match.group(1)), int(match.group(2)), match.group(3)
+    h2, m2, p2 = int(match.group(4)), int(match.group(5)), match.group(6)
+    t1 = (h1 % 12 + (12 if p1 == "PM" else 0)) * 60 + m1
+    t2 = (h2 % 12 + (12 if p2 == "PM" else 0)) * 60 + m2
+    diff = t2 - t1
+    return 14 <= diff <= 16  # 15 minutes with tolerance
+
+
+def _matches_window(question, window):
+    """Check if a market question matches the desired window duration."""
+    if window == "5m":
+        return _is_5m_market(question)
+    elif window == "15m":
+        return _is_15m_market(question)
+    return True
+
+
 def _import_current_5m_markets(asset, api_key):
     """Construct and import the current and next 5-minute markets by slug."""
     now_utc = datetime.now(timezone.utc)
@@ -314,7 +344,7 @@ def discover_fast_market_markets(asset="BTC", window="5m", api_key=None):
                 if mid in seen_ids:
                     continue
                 question_raw = m.get("question", "")
-                if window == "5m" and not _is_5m_market(question_raw):
+                if not _matches_window(question_raw, window):
                     continue
                 end_time = None
                 resolves_at = m.get("resolves_at", "")
@@ -345,16 +375,17 @@ def discover_fast_market_markets(asset="BTC", window="5m", api_key=None):
 
     # Step 2: If no near market on Simmer, eagerly import from Polymarket.
     # Try the current and next window to maximise chance of finding a live market.
+    window_seconds = 900 if window == "15m" else 300  # 15m = 900s, 5m = 300s
     has_near_market = any(
-        m.get("end_time") and MIN_TIME_REMAINING < (m["end_time"] - now_utc).total_seconds() <= 300
+        m.get("end_time") and MIN_TIME_REMAINING < (m["end_time"] - now_utc).total_seconds() <= window_seconds
         for m in markets
     )
-    if not has_near_market and window == "5m" and api_key:
+    if not has_near_market and window in ("5m", "15m") and api_key:
         now_ts = int(now_utc.timestamp())
         asset_lower = asset.lower()
         for offset in range(2):  # current window, then next window
-            ws_ts = (now_ts // 300) * 300 + (300 * offset)
-            we_ts = ws_ts + 300
+            ws_ts = (now_ts // window_seconds) * window_seconds + (window_seconds * offset)
+            we_ts = ws_ts + window_seconds
             ws_utc = datetime.fromtimestamp(ws_ts, tz=timezone.utc)
             we_utc = datetime.fromtimestamp(we_ts, tz=timezone.utc)
             we_end = we_utc
@@ -367,7 +398,7 @@ def discover_fast_market_markets(asset="BTC", window="5m", api_key=None):
                     break
             if already:
                 continue
-            slug = f"{asset_lower}-updown-5m-{ws_ts}"
+            slug = f"{asset_lower}-updown-{window}-{ws_ts}"
             market_id, err = import_fast_market_market(api_key, slug)
             ws_et = ws_utc - timedelta(hours=5)
             we_et = we_utc - timedelta(hours=5)
@@ -428,18 +459,17 @@ def _parse_fast_market_end_time(question):
     return None
 
 
-def find_best_fast_market(markets):
+def find_best_fast_market(markets, window="5m"):
     """Pick the best fast_market to trade: soonest expiring that is currently in play."""
     now = datetime.now(timezone.utc)
+    max_remaining = 900 if window == "15m" else 300
     candidates = []
     for m in markets:
         end_time = m.get("end_time")
         if not end_time:
             continue
         remaining = (end_time - now).total_seconds()
-        # Only trade the current 5m window: must have <=300s left (already started)
-        # and at least MIN_TIME_REMAINING to avoid expired markets
-        if MIN_TIME_REMAINING < remaining <= 300:
+        if MIN_TIME_REMAINING < remaining <= max_remaining:
             candidates.append((remaining, m))
 
     if not candidates:
@@ -448,7 +478,7 @@ def find_best_fast_market(markets):
             end_time = m.get("end_time")
             if end_time:
                 remaining = (end_time - now).total_seconds()
-                print(f"  DEBUG: {m.get('question', '?')[:50]} | remaining={remaining:.0f}s | need {MIN_TIME_REMAINING}-300s")
+                print(f"  DEBUG: {m.get('question', '?')[:50]} | remaining={remaining:.0f}s | need {MIN_TIME_REMAINING}-{max_remaining}s")
         return None
     # Sort by soonest expiring
     candidates.sort(key=lambda x: x[0])
@@ -771,9 +801,13 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
     """Run one cycle of the fast_market trading strategy for a single asset.
     Returns True if a trade was executed/attempted, False otherwise."""
 
+    # Determine window for this asset (BTC=5m, ETH/SOL=15m)
+    asset_window = ASSET_WINDOWS.get(asset, WINDOW)
+    max_remaining = 900 if asset_window == "15m" else 300
+
     # Step 1: Discover fast markets for this asset
-    log(f"\n🔍 Discovering {asset} fast markets...")
-    markets = discover_fast_market_markets(asset, WINDOW, api_key=api_key)
+    log(f"\n🔍 Discovering {asset} fast markets ({asset_window})...")
+    markets = discover_fast_market_markets(asset, asset_window, api_key=api_key)
     log(f"  Found {len(markets)} active fast markets")
 
     if not markets:
@@ -781,9 +815,9 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
         return False
 
     # Step 2: Find best fast_market to trade
-    best = find_best_fast_market(markets)
+    best = find_best_fast_market(markets, window=asset_window)
     if not best:
-        log(f"  No fast_markets with {MIN_TIME_REMAINING}s-300s remaining")
+        log(f"  No fast_markets with {MIN_TIME_REMAINING}s-{max_remaining}s remaining")
         return False
 
     end_time = best.get("end_time")
