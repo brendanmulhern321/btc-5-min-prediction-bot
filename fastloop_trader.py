@@ -288,6 +288,9 @@ def discover_fast_market_markets(asset="BTC", window="5m", api_key=None):
                         pass
                 if not end_time:
                     end_time = _parse_fast_market_end_time(question_raw)
+                # Skip markets that have already ended
+                if end_time and end_time < now_utc:
+                    continue
                 yes_price = m.get("external_price_yes", 0.5)
                 no_price = 1 - yes_price if yes_price else 0.5
                 seen_ids.add(mid)
@@ -382,7 +385,7 @@ def _parse_fast_market_end_time(question):
 
 
 def find_best_fast_market(markets):
-    """Pick the best fast_market to trade: soonest expiring with enough time remaining."""
+    """Pick the best fast_market to trade: soonest expiring that is currently in play."""
     now = datetime.now(timezone.utc)
     candidates = []
     for m in markets:
@@ -390,7 +393,10 @@ def find_best_fast_market(markets):
         if not end_time:
             continue
         remaining = (end_time - now).total_seconds()
-        if MIN_TIME_REMAINING < remaining <= MAX_TIME_REMAINING:
+        # For 5m markets, only trade the current window (ends within 600s)
+        # This ensures we never trade a market that hasn't started yet
+        max_remaining = min(MAX_TIME_REMAINING, 600)
+        if MIN_TIME_REMAINING < remaining <= max_remaining:
             candidates.append((remaining, m))
 
     if not candidates:
