@@ -107,9 +107,9 @@ ASSET_PATTERNS = {
     "SOL": ["solana up or down"],
 }
 
-# Asset → market window (Polymarket only has 5m for BTC; ETH/SOL are 15m)
+# Asset → market window
 ASSET_WINDOWS = {
-    "BTC": "5m",
+    "BTC": "15m",
     "ETH": "15m",
     "SOL": "15m",
 }
