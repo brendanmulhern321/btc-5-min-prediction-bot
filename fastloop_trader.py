@@ -85,7 +85,7 @@ ASSET_SYMBOLS = {
 # Discord webhook for trade notifications
 DISCORD_WEBHOOK_URL = os.environ.get(
     "DISCORD_WEBHOOK_URL",
-    "https://discord.com/api/webhooks/1463731362619064524/oNnCWiJ4fKO5ZkGovFATxvPpDvmNO-fNVuBdKnWOgXEC36zpA4XlVeb1jcyWUnt7bzs8"
+    "https://discord.com/api/webhooks/1473076945120919704/NfnsIdHIFOoyQu9gN-jOa95x6xMI1oIMByK15130jnNmPos49hfsSucV_p5Mz-GCpesY"
 )
 
 
@@ -96,7 +96,8 @@ def send_discord_notification(message):
     try:
         data = json.dumps({"content": message}).encode("utf-8")
         req = Request(DISCORD_WEBHOOK_URL, data=data, method="POST",
-                      headers={"Content-Type": "application/json"})
+                      headers={"Content-Type": "application/json",
+                               "User-Agent": "FastLoop-Bot/1.0"})
         urlopen(req, timeout=10)
     except Exception as e:
         print(f"  ⚠️  Discord notification failed: {e}", file=sys.stderr, flush=True)
