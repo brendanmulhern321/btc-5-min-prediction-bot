@@ -919,10 +919,13 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
                 print(f"📊 {asset} Summary: No trade (fees eat the edge)")
             return False
 
-    # We have a signal! Size to exactly 5 shares.
+    # We have a signal! Size to meet the 5-share minimum.
+    # The displayed price is mid-market; actual fill price includes spread,
+    # so we add a 2x buffer to ensure we clear the minimum after rounding.
     price = market_yes_price if side == "yes" else (1 - market_yes_price)
-    target_shares = 5
+    target_shares = 10
     position_size = round(target_shares * price, 2)
+    position_size = min(position_size, MAX_POSITION_USD)
 
     if position_size < 0.01:
         log(f"  ⚠️  Price ${price:.3f} too low to size 5 shares")
