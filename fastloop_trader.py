@@ -393,8 +393,10 @@ def find_best_fast_market(markets):
         if not end_time:
             continue
         remaining = (end_time - now).total_seconds()
-        # For 5m markets, only trade the current window (ends within 600s)
-        # This ensures we never trade a market that hasn't started yet
+        # Only trade markets that have already started (end_time - 5min <= now)
+        start_time = end_time - timedelta(minutes=5)
+        if start_time > now:
+            continue  # market hasn't started yet
         max_remaining = min(MAX_TIME_REMAINING, 600)
         if MIN_TIME_REMAINING < remaining <= max_remaining:
             candidates.append((remaining, m))
