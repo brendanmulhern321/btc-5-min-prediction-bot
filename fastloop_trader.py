@@ -399,6 +399,12 @@ def find_best_fast_market(markets):
             candidates.append((remaining, m))
 
     if not candidates:
+        # Debug: show why no markets qualified
+        for m in markets:
+            end_time = m.get("end_time")
+            if end_time:
+                remaining = (end_time - now).total_seconds()
+                print(f"  DEBUG: {m.get('question', '?')[:50]} | remaining={remaining:.0f}s | need {MIN_TIME_REMAINING}-300s")
         return None
     # Sort by soonest expiring
     candidates.sort(key=lambda x: x[0])
@@ -761,7 +767,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     # Step 2: Find best fast_market to trade
     best = find_best_fast_market(markets)
     if not best:
-        log(f"  No fast_markets with {MIN_TIME_REMAINING}s-{MAX_TIME_REMAINING}s remaining")
+        log(f"  No fast_markets with {MIN_TIME_REMAINING}s-300s remaining")
         if not quiet:
             print("📊 Summary: No tradeable fast_markets (none in time window)")
         return
