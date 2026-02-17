@@ -528,6 +528,7 @@ def discover_above_below_markets(asset, current_price, api_key=None):
 
         # Try importing to get real price
         if api_key:
+            print(f"  📥 Importing: {slug}", flush=True)
             market_id, err = import_fast_market_market(api_key, slug)
             if market_id:
                 imported_count += 1
@@ -542,6 +543,7 @@ def discover_above_below_markets(asset, current_price, api_key=None):
                         except (json.JSONDecodeError, IndexError, ValueError):
                             yes_price = 0.5
                 no_price = 1 - yes_price
+                print(f"    ✅ Level ${level:,.0f}: YES=${yes_price:.4f} NO=${no_price:.4f}", flush=True)
                 seen_levels.add(level)
                 markets.append({
                     "question": details.get("question", f"{name} above {level} on {resolve_date.strftime('%B')} {resolve_date.day}?"),
@@ -555,6 +557,8 @@ def discover_above_below_markets(asset, current_price, api_key=None):
                     "fee_rate_bps": 0,
                 })
                 continue
+            else:
+                print(f"    ❌ Import failed: {err}", flush=True)
 
         # Fallback: add as unimported candidate
         markets.append({
@@ -576,9 +580,9 @@ def select_best_price_level(markets, direction, current_price, max_buy_price=0.0
     """Pick the best above/below sub-market based on momentum direction.
 
     UP momentum: buy YES on levels ABOVE current price where YES <= max_buy_price
-                 (betting BTC will rise above that level)
-    DOWN momentum: buy NO on levels BELOW current price where NO <= max_buy_price
-                   (betting BTC will drop below that level)
+                 (e.g., YES on "above 72k" at 1.5¢ when BTC is 67.5k — pays if BTC pumps)
+    DOWN momentum: buy NO on levels near/below current price where NO <= max_buy_price
+                   (e.g., NO on "above 64k" at 2.1¢ when BTC is 67.5k — pays if BTC drops below 64k)
 
     Returns (side, buy_price, market) or None if nothing qualifies.
     """
@@ -599,13 +603,25 @@ def select_best_price_level(markets, direction, current_price, max_buy_price=0.0
             if yes_price <= max_buy_price and yes_price > 0:
                 distance = level - current_price
                 candidates.append((distance, "yes", yes_price, m))
-        elif direction == "down" and level < current_price:
-            # Buy NO — cheap when level is far below current price
+        elif direction == "down":
+            # Buy NO on any level — NO is cheap on levels slightly below current price
+            # e.g., "above 64k" when BTC=67.5k: NO=2.1¢, pays if BTC drops below 64k
             if no_price <= max_buy_price and no_price > 0:
-                distance = current_price - level
+                distance = abs(current_price - level)
                 candidates.append((distance, "no", no_price, m))
 
     if not candidates:
+        # Debug: show what prices we saw
+        for m in markets:
+            level = m.get("price_level")
+            mid = m.get("simmer_market_id", "")
+            try:
+                prices = json.loads(m.get("outcome_prices", "[]"))
+                yp = float(prices[0]) if prices else 0.5
+            except Exception:
+                yp = 0.5
+            imported = "✓" if mid else "✗"
+            print(f"    [{imported}] ${level:>10,.0f}: YES=${yp:.4f} NO=${1-yp:.4f}", flush=True)
         return None
     # Sort by distance ascending — closest level = most likely to hit
     candidates.sort(key=lambda x: x[0])
