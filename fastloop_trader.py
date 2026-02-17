@@ -67,8 +67,8 @@ CONFIG_SCHEMA = {
                "help": "Assets to trade, e.g. ['BTC', 'ETH']"},
     "asset": {"default": "", "env": "SIMMER_SPRINT_ASSET", "type": str,
               "help": "(Deprecated) Single asset — use 'assets' list instead"},
-    "window": {"default": "1h", "env": "SIMMER_SPRINT_WINDOW", "type": str,
-               "help": "Market window duration (5m, 15m, or 1h)"},
+    "window": {"default": "daily", "env": "SIMMER_SPRINT_WINDOW", "type": str,
+               "help": "Market window duration (5m, 15m, 1h, or daily)"},
     "volume_confidence": {"default": True, "env": "SIMMER_SPRINT_VOL_CONF", "type": bool,
                           "help": "Weight signal by volume (higher volume = more confident)"},
 }
@@ -106,18 +106,26 @@ def send_discord_notification(message):
 
 # Asset → Gamma API search patterns
 ASSET_PATTERNS = {
-    "BTC": ["bitcoin up or down"],
-    "ETH": ["ethereum up or down"],
-    "SOL": ["solana up or down"],
-    "XRP": ["xrp up or down", "ripple up or down"],
+    "BTC": ["bitcoin above"],
+    "ETH": ["ethereum above"],
+    "SOL": ["solana above"],
+    "XRP": ["xrp above"],
 }
 
 # Asset → market window
 ASSET_WINDOWS = {
-    "BTC": "1h",
-    "ETH": "1h",
-    "SOL": "1h",
-    "XRP": "1h",
+    "BTC": "daily",
+    "ETH": "daily",
+    "SOL": "daily",
+    "XRP": "daily",
+}
+
+# Asset → price level increment and slug format for above/below markets
+ASSET_LEVEL_CONFIG = {
+    "BTC": {"increment": 2000, "unit": "k", "divisor": 1000},    # 66k, 68k, 70k
+    "ETH": {"increment": 100,  "unit": "",  "divisor": 1},       # 1900, 2000, 2100
+    "SOL": {"increment": 10,   "unit": "",  "divisor": 1},       # 80, 90, 100
+    "XRP": {"increment": 0.10, "unit": "pt", "divisor": 1},      # 1pt4, 1pt5, 1pt6
 }
 
 # Asset → keyword for matching positions (lowercase)
@@ -308,6 +316,11 @@ def _is_hourly_market(question):
     return False
 
 
+def _is_above_below_market(question):
+    """Check if question describes an above/below price level market."""
+    return "above" in question.lower() and "on " in question.lower()
+
+
 def _matches_window(question, window):
     """Check if a market question matches the desired window duration.
     Returns False for any unrecognized window or non-matching duration."""
@@ -317,7 +330,95 @@ def _matches_window(question, window):
         return _is_15m_market(question)
     elif window == "1h":
         return _is_hourly_market(question)
+    elif window == "daily":
+        return _is_above_below_market(question)
     return False  # reject unknown windows
+
+
+def _parse_above_below_end_time(question):
+    """Parse end time from 'Bitcoin above Xk on Month Day' format.
+    These resolve at noon ET on the specified date."""
+    import re
+    match = re.search(r'on\s+(\w+)\s+(\d+)', question, re.IGNORECASE)
+    if match:
+        try:
+            month_str = match.group(1)
+            day = int(match.group(2))
+            year = datetime.now(timezone.utc).year
+            dt = datetime.strptime(f"{month_str} {day} {year} 12:00PM", "%B %d %Y %I:%M%p")
+            dt = dt.replace(tzinfo=timezone.utc) + timedelta(hours=5)  # noon ET -> UTC
+            return dt
+        except Exception:
+            pass
+    return None
+
+
+def _parse_price_level(question):
+    """Extract price level from above/below question text.
+    'Bitcoin above 72k on ...' -> 72000
+    'Ethereum above 2200 on ...' -> 2200
+    'Solana above 100 on ...' -> 100
+    'XRP above 1pt5 on ...' -> 1.5
+    """
+    import re
+    q = question.lower()
+    # BTC format: "above 72k"
+    match = re.search(r'above\s+(\d+)k\s+on', q)
+    if match:
+        return int(match.group(1)) * 1000
+    # XRP format: "above 1pt5" or "above 0pt8"
+    match = re.search(r'above\s+(\d+)pt(\d+)\s+on', q)
+    if match:
+        return float(f"{match.group(1)}.{match.group(2)}")
+    # ETH/SOL format: "above 2200" or "above 100"
+    match = re.search(r'above\s+(\d+)\s+on', q)
+    if match:
+        return float(match.group(1))
+    return None
+
+
+def _build_above_slug(asset, price_level, resolve_date):
+    """Build Polymarket slug for an above/below sub-market.
+    Returns: 'bitcoin-above-72k-on-february-18'
+    """
+    cfg = ASSET_LEVEL_CONFIG.get(asset, {})
+    name = ASSET_KEYWORDS.get(asset, asset.lower())
+    month = resolve_date.strftime('%B').lower()
+    day = resolve_date.day
+
+    if cfg.get("unit") == "k":
+        # BTC: divide by 1000, format as "72k"
+        level_str = f"{int(price_level // 1000)}k"
+    elif cfg.get("unit") == "pt":
+        # XRP: format as "1pt5", "0pt8"
+        whole = int(price_level)
+        frac = round((price_level - whole) * 10)
+        if frac == 0:
+            level_str = str(whole)
+        else:
+            level_str = f"{whole}pt{frac}"
+    else:
+        # ETH/SOL: plain number
+        level_str = str(int(price_level))
+
+    return f"{name}-above-{level_str}-on-{month}-{day}"
+
+
+def _generate_price_levels(asset, current_price, num_levels=6):
+    """Generate candidate price levels around the current price for an asset.
+    Returns list of price levels above and below current price.
+    """
+    cfg = ASSET_LEVEL_CONFIG.get(asset, {"increment": 1000})
+    increment = cfg["increment"]
+
+    # Round current price to nearest increment
+    base = round(current_price / increment) * increment
+    levels = []
+    for offset in range(-num_levels, num_levels + 1):
+        level = base + (offset * increment)
+        if level > 0:
+            levels.append(level)
+    return sorted(levels)
 
 
 def _import_current_5m_markets(asset, api_key):
@@ -350,6 +451,127 @@ def _import_current_5m_markets(asset, api_key):
                 "fee_rate_bps": 0,
             })
     return markets
+
+
+def discover_above_below_markets(asset, current_price, api_key=None):
+    """Find active above/below price level markets for an asset.
+    Returns list of sub-markets with price_level field."""
+    patterns = ASSET_PATTERNS.get(asset, [f"{ASSET_KEYWORDS.get(asset, asset.lower())} above"])
+    markets = []
+    seen_levels = set()
+    now_utc = datetime.now(timezone.utc)
+
+    # Step 1: Check Simmer for already-imported above/below markets
+    if api_key:
+        result = simmer_request("/api/sdk/markets", api_key=api_key)
+        if result and isinstance(result, dict) and "markets" in result:
+            for m in result["markets"]:
+                q = (m.get("question") or "").lower()
+                if not any(p in q for p in patterns):
+                    continue
+                if m.get("status") != "active":
+                    continue
+                price_level = _parse_price_level(m.get("question", ""))
+                if price_level is None:
+                    continue
+                end_time = None
+                resolves_at = m.get("resolves_at", "")
+                if resolves_at:
+                    try:
+                        resolves_at = resolves_at.replace("Z", "+00:00").replace(" ", "T")
+                        end_time = datetime.fromisoformat(resolves_at)
+                    except Exception:
+                        pass
+                if not end_time:
+                    end_time = _parse_above_below_end_time(m.get("question", ""))
+                if end_time and end_time < now_utc:
+                    continue  # already resolved
+                yes_price = m.get("external_price_yes", 0.5)
+                no_price = 1 - yes_price if yes_price else 0.5
+                seen_levels.add(price_level)
+                markets.append({
+                    "question": m.get("question", ""),
+                    "slug": "",
+                    "simmer_market_id": m.get("id", ""),
+                    "condition_id": "",
+                    "end_time": end_time,
+                    "price_level": price_level,
+                    "outcomes": ["Yes", "No"],
+                    "outcome_prices": json.dumps([str(yes_price), str(no_price)]),
+                    "fee_rate_bps": 0,
+                })
+
+    # Step 2: Build candidate slugs for levels not yet on Simmer
+    now_et = now_utc - timedelta(hours=5)
+    # Resolve date: today if before noon ET, otherwise tomorrow
+    if now_et.hour < 12:
+        resolve_date = now_et.date()
+    else:
+        resolve_date = (now_et + timedelta(days=1)).date()
+    # End time = noon ET on resolve date = 5PM UTC
+    resolve_dt = datetime(resolve_date.year, resolve_date.month, resolve_date.day,
+                          17, 0, 0, tzinfo=timezone.utc)
+
+    levels = _generate_price_levels(asset, current_price, num_levels=6)
+    for level in levels:
+        if level in seen_levels:
+            continue
+        slug = _build_above_slug(asset, level, resolve_date)
+        name = ASSET_KEYWORDS.get(asset, asset.lower()).title()
+        markets.append({
+            "question": f"{name} above {level} on {resolve_date.strftime('%B')} {resolve_date.day}?",
+            "slug": slug,
+            "simmer_market_id": "",
+            "condition_id": "",
+            "end_time": resolve_dt,
+            "price_level": level,
+            "outcomes": ["Yes", "No"],
+            "outcome_prices": json.dumps(["0.5", "0.5"]),  # unknown until imported
+            "fee_rate_bps": 0,
+        })
+
+    return markets
+
+
+def select_best_price_level(markets, direction, current_price, max_buy_price=0.05):
+    """Pick the best above/below sub-market based on momentum direction.
+
+    UP momentum: buy YES on levels ABOVE current price where YES <= max_buy_price
+                 (betting BTC will rise above that level)
+    DOWN momentum: buy NO on levels BELOW current price where NO <= max_buy_price
+                   (betting BTC will drop below that level)
+
+    Returns (side, buy_price, market) or None if nothing qualifies.
+    """
+    candidates = []
+    for m in markets:
+        level = m.get("price_level")
+        if level is None:
+            continue
+        try:
+            prices = json.loads(m.get("outcome_prices", "[]"))
+            yes_price = float(prices[0]) if prices else 0.5
+        except (json.JSONDecodeError, IndexError, ValueError):
+            yes_price = 0.5
+        no_price = 1 - yes_price
+
+        if direction == "up" and level > current_price:
+            # Buy YES — cheap when level is far above current price
+            if yes_price <= max_buy_price and yes_price > 0:
+                distance = level - current_price
+                candidates.append((distance, "yes", yes_price, m))
+        elif direction == "down" and level < current_price:
+            # Buy NO — cheap when level is far below current price
+            if no_price <= max_buy_price and no_price > 0:
+                distance = current_price - level
+                candidates.append((distance, "no", no_price, m))
+
+    if not candidates:
+        return None
+    # Sort by distance ascending — closest level = most likely to hit
+    candidates.sort(key=lambda x: x[0])
+    best = candidates[0]
+    return best[1], best[2], best[3]  # (side, price, market)
 
 
 def discover_fast_market_markets(asset="BTC", window="5m", api_key=None):
@@ -748,7 +970,7 @@ def get_positions(api_key):
 
 
 def liquidate_wrong_contracts(api_key, log_fn=None):
-    """Auto-sell any positions that are NOT hourly markets (e.g. 15m/5m contracts).
+    """Auto-sell any positions that are NOT above/below markets (e.g. up/down contracts).
     Skips resolved/expired positions that can't be sold."""
     if log_fn is None:
         log_fn = print
@@ -757,18 +979,22 @@ def liquidate_wrong_contracts(api_key, log_fn=None):
     liquidated = 0
     for pos in positions:
         q = pos.get("question", "") or ""
-        if "up or down" not in q.lower():
+        ql = q.lower()
+        # Only look at crypto prediction markets
+        if "up or down" not in ql and "above" not in ql:
             continue
         if pos.get("redeemable"):
             continue  # let redeem handle these
         # Skip expired/resolved markets — can't sell these
-        pos_end = _parse_fast_market_end_time(q)
+        pos_end = _parse_above_below_end_time(q)
+        if not pos_end:
+            pos_end = _parse_fast_market_end_time(q)
         if pos_end and pos_end < now_utc:
             continue
-        # Check if this is an hourly market — if not, liquidate it
-        if _is_hourly_market(q):
+        # Keep above/below markets — liquidate everything else (up/down)
+        if _is_above_below_market(q):
             continue  # good, this is what we want
-        # This is a wrong contract (15m, 5m, etc.) — sell it
+        # This is a wrong contract (up/down, 15m, 5m, hourly, etc.) — sell it
         market_id = pos.get("market_id", "")
         shares_yes = pos.get("shares_yes", 0)
         shares_no = pos.get("shares_no", 0)
@@ -869,18 +1095,22 @@ def calculate_position_size(api_key, max_size, smart_sizing=False):
 # =============================================================================
 
 def _has_active_position_for_asset(asset, positions, now_utc):
-    """Check if there's already an active fast market position for this specific asset.
+    """Check if there's already an active position for this specific asset.
     Returns the matching position (or None)."""
     keywords = [ASSET_KEYWORDS.get(asset, asset.lower()), asset.lower()]
     for p in positions:
         q = (p.get("question", "") or "").lower()
-        if "up or down" not in q:
+        # Match both "up or down" and "above" market types
+        if "up or down" not in q and "above" not in q:
             continue
         if not any(kw in q for kw in keywords):
             continue  # different asset
         if p.get("redeemable"):
             continue
-        pos_end = _parse_fast_market_end_time(p.get("question", ""))
+        # Try parsing end time for both formats
+        pos_end = _parse_above_below_end_time(p.get("question", ""))
+        if not pos_end:
+            pos_end = _parse_fast_market_end_time(p.get("question", ""))
         if pos_end and pos_end < now_utc:
             continue  # market already ended
         return p
@@ -888,7 +1118,7 @@ def _has_active_position_for_asset(asset, positions, now_utc):
 
 
 def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
-    """Run one cycle of the fast_market trading strategy for a single asset.
+    """Run one cycle of the above/below trading strategy for a single asset.
     Returns True if a trade was executed/attempted, False otherwise."""
 
     # Step 0: Check for existing position FIRST (avoid unnecessary API calls)
@@ -903,46 +1133,7 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
                     print(f"📊 {asset} Summary: Existing position in '{existing.get('question', 'Unknown')[:50]}...'")
                 return False
 
-    # Determine window for this asset
-    asset_window = ASSET_WINDOWS.get(asset, WINDOW)
-    # For hourly markets, enter in the last 15 minutes for best contract prices
-    max_remaining = {"5m": 300, "15m": 900, "1h": 3600}.get(asset_window, 300)
-
-    # Step 1: Discover fast markets for this asset
-    log(f"\n🔍 Discovering {asset} fast markets ({asset_window})...")
-    markets = discover_fast_market_markets(asset, asset_window, api_key=api_key)
-    log(f"  Found {len(markets)} active fast markets")
-
-    if not markets:
-        log("  No active fast markets found")
-        return False
-
-    # Step 2: Find best fast_market to trade
-    best = find_best_fast_market(markets, window=asset_window)
-    if not best:
-        log(f"  No fast_markets with {MIN_TIME_REMAINING}s-{max_remaining}s remaining")
-        return False
-
-    end_time = best.get("end_time")
-    remaining = (end_time - datetime.now(timezone.utc)).total_seconds() if end_time else 0
-    log(f"\n🎯 Selected: {best['question']}")
-    log(f"  Expires in: {remaining:.0f}s")
-
-    # Parse current market odds
-    try:
-        prices = json.loads(best.get("outcome_prices", "[]"))
-        market_yes_price = float(prices[0]) if prices else 0.5
-    except (json.JSONDecodeError, IndexError, ValueError):
-        market_yes_price = 0.5
-    log(f"  Current YES price: ${market_yes_price:.3f}")
-
-    # Fee info (fast markets charge 10% on winnings)
-    fee_rate_bps = best.get("fee_rate_bps", 0)
-    fee_rate = fee_rate_bps / 10000  # 1000 bps -> 0.10
-    if fee_rate > 0:
-        log(f"  Fee rate:         {fee_rate:.0%} (Polymarket fast market fee)")
-
-    # Step 3: Get CEX price momentum
+    # Step 1: Get CEX price momentum FIRST (need current price for market discovery)
     log(f"\n📈 Fetching {asset} price signal ({SIGNAL_SOURCE})...")
     momentum = get_momentum(asset, SIGNAL_SOURCE, LOOKBACK_MINUTES)
 
@@ -950,25 +1141,15 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
         log("  ❌ Failed to fetch price data", force=True)
         return False
 
-    log(f"  Price: ${momentum['price_now']:,.2f} (was ${momentum['price_then']:,.2f})")
+    current_price = momentum['price_now']
+    direction = momentum['direction']
+    momentum_pct = abs(momentum["momentum_pct"])
+
+    log(f"  Price: ${current_price:,.2f} (was ${momentum['price_then']:,.2f})")
     log(f"  Momentum: {momentum['momentum_pct']:+.3f}%")
-    log(f"  Direction: {momentum['direction']}")
+    log(f"  Direction: {direction}")
     if VOLUME_CONFIDENCE:
         log(f"  Volume ratio: {momentum['volume_ratio']:.2f}x avg")
-
-    # Step 4: Decision logic
-    log(f"\n🧠 Analyzing {asset}...")
-
-    momentum_pct = abs(momentum["momentum_pct"])
-    direction = momentum["direction"]
-
-    # Skip if market already repriced (no liquidity / no edge).
-    # If YES is far from $0.50, someone already arbed it.
-    if abs(market_yes_price - 0.50) > 0.10:
-        log(f"  ⏸️  Market already repriced (YES=${market_yes_price:.3f}, far from $0.50) — no edge")
-        if not quiet:
-            print(f"📊 {asset} Summary: No trade (market already repriced to ${market_yes_price:.3f})")
-        return False
 
     # Check minimum momentum
     if momentum_pct < MIN_MOMENTUM_PCT:
@@ -977,48 +1158,42 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
             print(f"📊 {asset} Summary: No trade (momentum too weak: {momentum_pct:.3f}%)")
         return False
 
-    # Calculate expected fair price based on momentum direction
-    if direction == "up":
-        side = "yes"
-        trade_rationale = f"{asset} up {momentum['momentum_pct']:+.3f}% w/ {remaining:.0f}s left, YES=${market_yes_price:.3f}"
-    else:
-        side = "no"
-        trade_rationale = f"{asset} down {momentum['momentum_pct']:+.3f}% w/ {remaining:.0f}s left, YES=${market_yes_price:.3f}"
+    # Step 2: Discover above/below markets at various price levels
+    log(f"\n🔍 Discovering {asset} above/below markets...")
+    markets = discover_above_below_markets(asset, current_price, api_key=api_key)
+    log(f"  Found {len(markets)} price levels")
+
+    if not markets:
+        log("  No above/below markets found")
+        return False
+
+    # Step 3: Select the best price level based on direction
+    log(f"\n🧠 Analyzing {asset} price levels...")
+    selection = select_best_price_level(markets, direction, current_price, MAX_BUY_PRICE)
+
+    if not selection:
+        log(f"  ⏸️  No contracts ≤ ${MAX_BUY_PRICE:.2f} in the {direction} direction — skip")
+        if not quiet:
+            print(f"📊 {asset} Summary: No trade (no cheap contracts for {direction} direction)")
+        return False
+
+    side, price, best = selection
+    level = best.get("price_level", 0)
+    end_time = best.get("end_time")
+    remaining = (end_time - datetime.now(timezone.utc)).total_seconds() if end_time else 0
+
+    log(f"\n🎯 Selected: {best['question']}")
+    log(f"  Price level: ${level:,.2f}")
+    log(f"  Side: {side.upper()} @ ${price:.3f}")
+    log(f"  Resolves in: {remaining:.0f}s")
 
     vol_note = ""
     if VOLUME_CONFIDENCE and momentum["volume_ratio"] > 2.0:
         vol_note = f" 📊 (volume: {momentum['volume_ratio']:.1f}x avg)"
 
-    # Divergence: how far the market is from our expected fair value
-    if side == "yes":
-        divergence = 0.50 + ENTRY_THRESHOLD - market_yes_price
-    else:
-        divergence = market_yes_price - (0.50 - ENTRY_THRESHOLD)
-
-    # Fee-aware EV check: require enough divergence to cover fees
-    if fee_rate > 0:
-        buy_price = market_yes_price if side == "yes" else (1 - market_yes_price)
-        win_profit = (1 - buy_price) * (1 - fee_rate)
-        breakeven = buy_price / (win_profit + buy_price)
-        fee_penalty = breakeven - 0.50
-        min_divergence = fee_penalty + 0.02
-        log(f"  Breakeven:        {breakeven:.1%} win rate (fee-adjusted, min divergence {min_divergence:.3f})")
-        if divergence < min_divergence:
-            log(f"  ⏸️  Divergence {divergence:.3f} < fee-adjusted minimum {min_divergence:.3f} — skip")
-            if not quiet:
-                print(f"📊 {asset} Summary: No trade (fees eat the edge)")
-            return False
+    trade_rationale = f"{asset} {direction} {momentum['momentum_pct']:+.3f}%, {side.upper()} 'above ${level:,.0f}' @ ${price:.3f}"
 
     # Size position: target 3000 shares of cheap contracts for max payout
-    price = market_yes_price if side == "yes" else (1 - market_yes_price)
-
-    # Skip contracts over max buy price — bad risk/reward
-    if price > MAX_BUY_PRICE:
-        log(f"  ⏸️  Buy price ${price:.3f} > ${MAX_BUY_PRICE:.2f} — bad risk/reward, skip")
-        if not quiet:
-            print(f"📊 {asset} Summary: No trade (buy price ${price:.3f} too high)")
-        return False
-
     target_shares = 3000
     position_size = round(target_shares * price, 2)
     position_size = min(position_size, MAX_POSITION_USD)
@@ -1030,7 +1205,6 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
         return False
 
     log(f"  ✅ Signal: {side.upper()} — {trade_rationale}{vol_note}", force=True)
-    log(f"  Divergence: {divergence:.3f}", force=True)
 
     # Re-check market is still current before trading
     if end_time:
@@ -1041,34 +1215,23 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
                 print(f"📊 {asset} Summary: No trade (market no longer current)")
             return False
 
-    # Step 5: Import & Trade
+    # Step 4: Import & Trade
     market_id = best.get("simmer_market_id", "")
     if not market_id:
-        # Re-check Simmer for this market before importing (may have been added since discovery)
+        # Re-check Simmer for this market before importing
         log(f"\n🔍 Checking Simmer for existing {asset} market...", force=True)
         asset_patterns = ASSET_PATTERNS.get(asset, [asset.lower()])
         existing = simmer_request("/api/sdk/markets", api_key=api_key)
         if existing and isinstance(existing, dict) and "markets" in existing:
             for m in existing["markets"]:
                 mq = (m.get("question") or "").lower()
-                if m.get("status") != "active" or "up or down" not in mq:
+                if m.get("status") != "active" or "above" not in mq:
                     continue
-                # Must match THIS asset's patterns
                 if not any(p in mq for p in asset_patterns):
                     continue
-                # Must match our target window
-                if not _matches_window(m.get("question", ""), asset_window):
-                    continue
-                m_end = None
-                resolves_at = m.get("resolves_at", "")
-                if resolves_at:
-                    try:
-                        resolves_at = resolves_at.replace("Z", "+00:00").replace(" ", "T")
-                        m_end = datetime.fromisoformat(resolves_at)
-                    except Exception:
-                        pass
-                best_end = best.get("end_time")
-                if best_end and m_end and abs((m_end - best_end).total_seconds()) < 60:
+                # Match by price level
+                m_level = _parse_price_level(m.get("question", ""))
+                if m_level and m_level == level:
                     market_id = m.get("id", "")
                     break
     if market_id:
@@ -1092,9 +1255,9 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
         if latest:
             try:
                 latest_prices = json.loads(latest.get("outcome_prices", "[]"))
-                latest_yes = float(latest_prices[0]) if latest_prices else market_yes_price
+                latest_yes = float(latest_prices[0]) if latest_prices else price
             except (json.JSONDecodeError, IndexError, ValueError):
-                latest_yes = market_yes_price
+                latest_yes = price
             latest_buy = latest_yes if side == "yes" else (1 - latest_yes)
             if latest_buy > MAX_BUY_PRICE:
                 log(f"  ⏸️  Live price ${latest_buy:.3f} > ${MAX_BUY_PRICE:.2f} — skip", force=True)
@@ -1131,7 +1294,7 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
 
             # Log to trade journal
             if trade_id and JOURNAL_AVAILABLE:
-                confidence = min(0.9, 0.5 + divergence + (momentum_pct / 100))
+                confidence = min(0.9, 0.5 + (momentum_pct / 100))
                 log_trade(
                     trade_id=trade_id,
                     source=TRADE_SOURCE,
@@ -1200,9 +1363,9 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     if positions_only:
         log("\n📊 Sprint Positions:")
         positions = get_positions(api_key)
-        fast_market_positions = [p for p in positions if "up or down" in (p.get("question", "") or "").lower()]
+        fast_market_positions = [p for p in positions if "above" in (p.get("question", "") or "").lower() or "up or down" in (p.get("question", "") or "").lower()]
         if not fast_market_positions:
-            log("  No open fast market positions")
+            log("  No open positions")
         else:
             for pos in fast_market_positions:
                 log(f"  • {pos.get('question', 'Unknown')[:60]}")
@@ -1221,7 +1384,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     if redeemed > 0:
         log(f"  Redeemed {redeemed} resolved position(s)")
 
-    # Step 0b: Auto-liquidate any wrong contracts (15m, 5m, etc.)
+    # Step 0b: Auto-liquidate any wrong contracts (up/down, 15m, 5m, etc.)
     liquidated = liquidate_wrong_contracts(api_key, log_fn=log)
     if liquidated > 0:
         log(f"  Liquidated {liquidated} wrong contract(s)")
