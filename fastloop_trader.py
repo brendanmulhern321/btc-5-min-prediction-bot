@@ -80,6 +80,7 @@ ASSET_SYMBOLS = {
     "BTC": "BTCUSDT",
     "ETH": "ETHUSDT",
     "SOL": "SOLUSDT",
+    "XRP": "XRPUSDT",
 }
 
 # Discord webhook for trade notifications
@@ -105,6 +106,7 @@ ASSET_PATTERNS = {
     "BTC": ["bitcoin up or down"],
     "ETH": ["ethereum up or down"],
     "SOL": ["solana up or down"],
+    "XRP": ["xrp up or down", "ripple up or down"],
 }
 
 # Asset → market window
@@ -112,6 +114,7 @@ ASSET_WINDOWS = {
     "BTC": "15m",
     "ETH": "15m",
     "SOL": "15m",
+    "XRP": "15m",
 }
 
 # Asset → keyword for matching positions (lowercase)
@@ -119,6 +122,7 @@ ASSET_KEYWORDS = {
     "BTC": "bitcoin",
     "ETH": "ethereum",
     "SOL": "solana",
+    "XRP": "xrp",
 }
 
 
@@ -564,7 +568,7 @@ def get_coingecko_momentum(asset="bitcoin", lookback_minutes=5):
     }
 
 
-COINGECKO_ASSETS = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana"}
+COINGECKO_ASSETS = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "XRP": "ripple"}
 
 
 def get_kraken_momentum(pair="XXBTZUSD", lookback_minutes=5):
@@ -635,6 +639,7 @@ KRAKEN_PAIRS = {
     "BTC": "XXBTZUSD",
     "ETH": "XETHZUSD",
     "SOL": "SOLUSD",
+    "XRP": "XXRPZUSD",
 }
 
 
