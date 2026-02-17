@@ -714,10 +714,12 @@ def get_positions(api_key):
 
 
 def liquidate_wrong_contracts(api_key, log_fn=None):
-    """Auto-sell any positions that are NOT 15-minute markets (e.g. hourly contracts)."""
+    """Auto-sell any positions that are NOT 15-minute markets (e.g. hourly contracts).
+    Skips resolved/expired positions that can't be sold."""
     if log_fn is None:
         log_fn = print
     positions = get_positions(api_key)
+    now_utc = datetime.now(timezone.utc)
     liquidated = 0
     for pos in positions:
         q = pos.get("question", "") or ""
@@ -725,6 +727,10 @@ def liquidate_wrong_contracts(api_key, log_fn=None):
             continue
         if pos.get("redeemable"):
             continue  # let redeem handle these
+        # Skip expired/resolved markets — can't sell these
+        pos_end = _parse_fast_market_end_time(q)
+        if pos_end and pos_end < now_utc:
+            continue
         # Check if this is a 15m market — if not, liquidate it
         if _is_15m_market(q):
             continue  # good, this is what we want
@@ -734,8 +740,8 @@ def liquidate_wrong_contracts(api_key, log_fn=None):
         shares_no = pos.get("shares_no", 0)
         side = "no" if shares_no > shares_yes else "yes"
         shares = shares_no if shares_no > shares_yes else shares_yes
-        if not market_id or shares <= 0:
-            continue
+        if not market_id or shares < 5:
+            continue  # skip if below Polymarket 5-share minimum
         log_fn(f"  ⚠️  Wrong contract detected: {q[:60]}")
         log_fn(f"  Selling {shares:.1f} {side.upper()} shares...")
         result = simmer_request("/api/sdk/trade", method="POST", data={
