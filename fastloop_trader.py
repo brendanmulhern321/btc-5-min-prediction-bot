@@ -803,9 +803,9 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
 
     # Determine window for this asset (BTC=5m, ETH/SOL=15m)
     asset_window = ASSET_WINDOWS.get(asset, WINDOW)
-    # Late-entry strategy: only enter in the last 2 minutes when the outcome
-    # is nearly decided but the market still prices at ~$0.50
-    max_remaining = 120
+    # Enter in the last 5 minutes — early enough for liquidity, late enough
+    # that momentum is meaningful
+    max_remaining = 300
 
     # Step 1: Discover fast markets for this asset
     log(f"\n🔍 Discovering {asset} fast markets ({asset_window})...")
@@ -873,38 +873,38 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
                     print(f"📊 {asset} Summary: Existing position in '{existing.get('question', 'Unknown')[:50]}...'")
                 return False
 
-    # Late-entry strategy: with <2 min left, even a small move is locked in.
-    # Scale the momentum threshold by time remaining — less time = lower bar.
-    time_factor = remaining / 120.0  # 1.0 at 120s, 0.5 at 60s
-    scaled_momentum_min = MIN_MOMENTUM_PCT * time_factor  # e.g. 0.12% * 0.5 = 0.06% at 60s
-    scaled_momentum_min = max(scaled_momentum_min, 0.04)  # floor: never go below 0.04%
-
-    if momentum_pct < scaled_momentum_min:
-        log(f"  ⏸️  Momentum {momentum_pct:.3f}% < scaled min {scaled_momentum_min:.3f}% ({remaining:.0f}s left) — skip")
+    # Skip if market already repriced (no liquidity / no edge).
+    # If YES is far from $0.50, someone already arbed it.
+    if abs(market_yes_price - 0.50) > 0.10:
+        log(f"  ⏸️  Market already repriced (YES=${market_yes_price:.3f}, far from $0.50) — no edge")
         if not quiet:
-            print(f"📊 {asset} Summary: No trade (momentum too weak for {remaining:.0f}s remaining)")
+            print(f"📊 {asset} Summary: No trade (market already repriced to ${market_yes_price:.3f})")
+        return False
+
+    # Check minimum momentum
+    if momentum_pct < MIN_MOMENTUM_PCT:
+        log(f"  ⏸️  Momentum {momentum_pct:.3f}% < minimum {MIN_MOMENTUM_PCT}% — skip")
+        if not quiet:
+            print(f"📊 {asset} Summary: No trade (momentum too weak: {momentum_pct:.3f}%)")
         return False
 
     # Calculate expected fair price based on momentum direction
     if direction == "up":
         side = "yes"
-        divergence = 0.50 + ENTRY_THRESHOLD - market_yes_price
         trade_rationale = f"{asset} up {momentum['momentum_pct']:+.3f}% w/ {remaining:.0f}s left, YES=${market_yes_price:.3f}"
     else:
         side = "no"
-        divergence = market_yes_price - (0.50 - ENTRY_THRESHOLD)
         trade_rationale = f"{asset} down {momentum['momentum_pct']:+.3f}% w/ {remaining:.0f}s left, YES=${market_yes_price:.3f}"
 
     vol_note = ""
     if VOLUME_CONFIDENCE and momentum["volume_ratio"] > 2.0:
         vol_note = f" 📊 (volume: {momentum['volume_ratio']:.1f}x avg)"
 
-    # Check divergence threshold
-    if divergence <= 0:
-        log(f"  ⏸️  Market already priced in: divergence {divergence:.3f} ≤ 0 — skip")
-        if not quiet:
-            print(f"📊 {asset} Summary: No trade (market already priced in)")
-        return False
+    # Divergence: how far the market is from our expected fair value
+    if side == "yes":
+        divergence = 0.50 + ENTRY_THRESHOLD - market_yes_price
+    else:
+        divergence = market_yes_price - (0.50 - ENTRY_THRESHOLD)
 
     # Fee-aware EV check: require enough divergence to cover fees
     if fee_rate > 0:
