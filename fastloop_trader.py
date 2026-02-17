@@ -76,6 +76,7 @@ CONFIG_SCHEMA = {
 TRADE_SOURCE = "sdk:fastloop"
 SMART_SIZING_PCT = 0.50  # 50% of balance per trade
 MIN_SHARES_PER_ORDER = 100  # Minimum shares — go big on cheap contracts
+SIMMER_MIN_SHARES = 5  # Exchange-enforced minimum order size
 MAX_BUY_PRICE = 0.10  # Never buy contracts priced above this (any asset)
 
 # Asset → Binance symbol mapping
@@ -1143,6 +1144,11 @@ def calculate_position_size(api_key, max_size, smart_sizing=False):
     return min(smart_size, max_size)
 
 
+def _round_up_cents(value):
+    """Round up to 2 decimals so submitted notional does not under-shoot minimums."""
+    return math.ceil(float(value) * 100.0) / 100.0
+
+
 # =============================================================================
 # Main Strategy Logic
 # =============================================================================
@@ -1332,6 +1338,7 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
         log(f"  [DRY RUN] Would buy {side.upper()} ${position_size:.2f} (~{est_shares:.1f} shares)", force=True)
     else:
         # Final guard: re-check live market price before submitting order
+        latest_yes = market_yes_price
         latest = get_market_details(api_key, market_id)
         if latest:
             try:
@@ -1346,6 +1353,30 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
                     print(f"📊 {asset} Summary: No trade (live buy price ${latest_buy:.3f} too high)")
                 return False
 
+        # Guard against "Order too small ... below minimum (5)" failures.
+        # Use conservative share price (more expensive side) to avoid underestimating.
+        conservative_share_price = max(latest_yes, 1 - latest_yes)
+        min_amount_for_order = _round_up_cents(SIMMER_MIN_SHARES * conservative_share_price)
+        if position_size < min_amount_for_order:
+            if min_amount_for_order <= MAX_POSITION_USD:
+                log(
+                    f"  ↑ Increasing size ${position_size:.2f} -> ${min_amount_for_order:.2f} "
+                    f"to satisfy {SIMMER_MIN_SHARES}-share minimum",
+                    force=True,
+                )
+                position_size = min_amount_for_order
+            else:
+                log(
+                    f"  ⏸️  Min order notional is ~${min_amount_for_order:.2f} "
+                    f"for {SIMMER_MIN_SHARES} shares (max position ${MAX_POSITION_USD:.2f}) — skip",
+                    force=True,
+                )
+                if not quiet:
+                    print(
+                        f"📊 {asset} Summary: No trade (min size ~${min_amount_for_order:.2f} "
+                        f"exceeds max position ${MAX_POSITION_USD:.2f})"
+                    )
+                return False
         log(f"  Executing {side.upper()} trade for ${position_size:.2f}...", force=True)
         result = execute_trade(api_key, market_id, side, position_size)
         log(f"  API response: {json.dumps(result) if result else 'None'}", force=True)
@@ -1584,3 +1615,4 @@ if __name__ == "__main__":
             smart_sizing=args.smart_sizing,
             quiet=args.quiet,
         )
+
