@@ -2,11 +2,11 @@
   "entry_threshold": 0.05,
   "min_momentum_pct": 0.01,
   "max_position": 1.0,
-  "max_buy_price": 0.05,
+  "max_buy_price": 0.10,
   "lookback_minutes": 5,
   "min_time_remaining": 60,
   "assets": ["BTC", "ETH", "SOL", "XRP"],
-  "window": "daily",
+  "window": "15m",
   "signal_source": "kraken",
   "volume_confidence": true
 }

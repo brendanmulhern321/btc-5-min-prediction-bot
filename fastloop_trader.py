@@ -53,7 +53,7 @@ CONFIG_SCHEMA = {
                          "help": "Min BTC % move in lookback window to trigger"},
     "max_position": {"default": 5.0, "env": "SIMMER_SPRINT_MAX_POSITION", "type": float,
                      "help": "Max $ per trade"},
-    "max_buy_price": {"default": 0.05, "env": "SIMMER_SPRINT_MAX_BUY", "type": float,
+    "max_buy_price": {"default": 0.10, "env": "SIMMER_SPRINT_MAX_BUY", "type": float,
                       "help": "Never buy contracts priced above this"},
     "signal_source": {"default": "binance", "env": "SIMMER_SPRINT_SIGNAL", "type": str,
                       "help": "Price feed source (binance, kraken, coingecko)"},
@@ -67,7 +67,7 @@ CONFIG_SCHEMA = {
                "help": "Assets to trade, e.g. ['BTC', 'ETH']"},
     "asset": {"default": "", "env": "SIMMER_SPRINT_ASSET", "type": str,
               "help": "(Deprecated) Single asset — use 'assets' list instead"},
-    "window": {"default": "daily", "env": "SIMMER_SPRINT_WINDOW", "type": str,
+    "window": {"default": "15m", "env": "SIMMER_SPRINT_WINDOW", "type": str,
                "help": "Market window duration (5m, 15m, 1h, or daily)"},
     "volume_confidence": {"default": True, "env": "SIMMER_SPRINT_VOL_CONF", "type": bool,
                           "help": "Weight signal by volume (higher volume = more confident)"},
@@ -76,7 +76,7 @@ CONFIG_SCHEMA = {
 TRADE_SOURCE = "sdk:fastloop"
 SMART_SIZING_PCT = 0.50  # 50% of balance per trade
 MIN_SHARES_PER_ORDER = 100  # Minimum shares — go big on cheap contracts
-MAX_BUY_PRICE = 0.05  # Never buy contracts priced above this (any asset)
+MAX_BUY_PRICE = 0.10  # Never buy contracts priced above this (any asset)
 
 # Asset → Binance symbol mapping
 ASSET_SYMBOLS = {
@@ -106,18 +106,18 @@ def send_discord_notification(message):
 
 # Asset → Gamma API search patterns
 ASSET_PATTERNS = {
-    "BTC": ["bitcoin above"],
-    "ETH": ["ethereum above"],
-    "SOL": ["solana above"],
-    "XRP": ["xrp above"],
+    "BTC": ["bitcoin up or down"],
+    "ETH": ["ethereum up or down"],
+    "SOL": ["solana up or down"],
+    "XRP": ["xrp up or down", "ripple up or down"],
 }
 
 # Asset → market window
 ASSET_WINDOWS = {
-    "BTC": "daily",
-    "ETH": "daily",
-    "SOL": "daily",
-    "XRP": "daily",
+    "BTC": "15m",
+    "ETH": "15m",
+    "SOL": "15m",
+    "XRP": "15m",
 }
 
 # Asset → price level increment and slug format for above/below markets
@@ -1025,7 +1025,7 @@ def get_positions(api_key):
 
 
 def liquidate_wrong_contracts(api_key, log_fn=None):
-    """Auto-sell any positions that are NOT above/below markets (e.g. up/down contracts).
+    """Auto-sell any positions that are NOT 15-minute up/down markets.
     Skips resolved/expired positions that can't be sold."""
     if log_fn is None:
         log_fn = print
@@ -1035,21 +1035,19 @@ def liquidate_wrong_contracts(api_key, log_fn=None):
     for pos in positions:
         q = pos.get("question", "") or ""
         ql = q.lower()
-        # Only look at crypto prediction markets
         if "up or down" not in ql and "above" not in ql:
             continue
         if pos.get("redeemable"):
             continue  # let redeem handle these
-        # Skip expired/resolved markets — can't sell these
-        pos_end = _parse_above_below_end_time(q)
+        pos_end = _parse_fast_market_end_time(q)
         if not pos_end:
-            pos_end = _parse_fast_market_end_time(q)
+            pos_end = _parse_above_below_end_time(q)
         if pos_end and pos_end < now_utc:
             continue
-        # Keep above/below markets — liquidate everything else (up/down)
-        if _is_above_below_market(q):
+        # Keep 15m markets — liquidate everything else
+        if _is_15m_market(q):
             continue  # good, this is what we want
-        # This is a wrong contract (up/down, 15m, 5m, hourly, etc.) — sell it
+        # This is a wrong contract (hourly, daily, above/below, etc.) — sell it
         market_id = pos.get("market_id", "")
         shares_yes = pos.get("shares_yes", 0)
         shares_no = pos.get("shares_no", 0)
@@ -1173,7 +1171,7 @@ def _has_active_position_for_asset(asset, positions, now_utc):
 
 
 def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
-    """Run one cycle of the above/below trading strategy for a single asset.
+    """Run one cycle of the 15m up/down trading strategy for a single asset.
     Returns True if a trade was executed/attempted, False otherwise."""
 
     # Step 0: Check for existing position FIRST (avoid unnecessary API calls)
@@ -1188,7 +1186,39 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
                     print(f"📊 {asset} Summary: Existing position in '{existing.get('question', 'Unknown')[:50]}...'")
                 return False
 
-    # Step 1: Get CEX price momentum FIRST (need current price for market discovery)
+    # Determine window for this asset
+    asset_window = ASSET_WINDOWS.get(asset, WINDOW)
+    max_remaining = {"5m": 300, "15m": 900, "1h": 3600, "daily": 86400}.get(asset_window, 900)
+
+    # Step 1: Discover fast markets for this asset
+    log(f"\n🔍 Discovering {asset} fast markets ({asset_window})...")
+    markets = discover_fast_market_markets(asset, asset_window, api_key=api_key)
+    log(f"  Found {len(markets)} active fast markets")
+
+    if not markets:
+        log("  No active fast markets found")
+        return False
+
+    # Step 2: Find best market to trade
+    best = find_best_fast_market(markets, window=asset_window)
+    if not best:
+        log(f"  No fast_markets with {MIN_TIME_REMAINING}s-{max_remaining}s remaining")
+        return False
+
+    end_time = best.get("end_time")
+    remaining = (end_time - datetime.now(timezone.utc)).total_seconds() if end_time else 0
+    log(f"\n🎯 Selected: {best['question']}")
+    log(f"  Expires in: {remaining:.0f}s")
+
+    # Parse current market odds
+    try:
+        prices = json.loads(best.get("outcome_prices", "[]"))
+        market_yes_price = float(prices[0]) if prices else 0.5
+    except (json.JSONDecodeError, IndexError, ValueError):
+        market_yes_price = 0.5
+    log(f"  Current YES price: ${market_yes_price:.3f}")
+
+    # Step 3: Get CEX price momentum
     log(f"\n📈 Fetching {asset} price signal ({SIGNAL_SOURCE})...")
     momentum = get_momentum(asset, SIGNAL_SOURCE, LOOKBACK_MINUTES)
 
@@ -1196,15 +1226,17 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
         log("  ❌ Failed to fetch price data", force=True)
         return False
 
-    current_price = momentum['price_now']
-    direction = momentum['direction']
-    momentum_pct = abs(momentum["momentum_pct"])
-
-    log(f"  Price: ${current_price:,.2f} (was ${momentum['price_then']:,.2f})")
+    log(f"  Price: ${momentum['price_now']:,.2f} (was ${momentum['price_then']:,.2f})")
     log(f"  Momentum: {momentum['momentum_pct']:+.3f}%")
-    log(f"  Direction: {direction}")
+    log(f"  Direction: {momentum['direction']}")
     if VOLUME_CONFIDENCE:
         log(f"  Volume ratio: {momentum['volume_ratio']:.2f}x avg")
+
+    # Step 4: Decision logic
+    log(f"\n🧠 Analyzing {asset}...")
+
+    momentum_pct = abs(momentum["momentum_pct"])
+    direction = momentum["direction"]
 
     # Check minimum momentum
     if momentum_pct < MIN_MOMENTUM_PCT:
@@ -1213,46 +1245,31 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
             print(f"📊 {asset} Summary: No trade (momentum too weak: {momentum_pct:.3f}%)")
         return False
 
-    # Step 2: Discover above/below markets at various price levels
-    log(f"\n🔍 Discovering {asset} above/below markets...")
-    markets = discover_above_below_markets(asset, current_price, api_key=api_key)
-    log(f"  Found {len(markets)} price levels")
-
-    if not markets:
-        log("  No above/below markets found")
-        return False
-
-    # Step 3: Select the best price level based on direction
-    log(f"\n🧠 Analyzing {asset} price levels...")
-    selection = select_best_price_level(markets, direction, current_price, MAX_BUY_PRICE)
-
-    if not selection:
-        log(f"  ⏸️  No contracts ≤ ${MAX_BUY_PRICE:.2f} in the {direction} direction — skip")
-        if not quiet:
-            print(f"📊 {asset} Summary: No trade (no cheap contracts for {direction} direction)")
-        return False
-
-    side, price, best = selection
-    level = best.get("price_level", 0)
-    end_time = best.get("end_time")
-    remaining = (end_time - datetime.now(timezone.utc)).total_seconds() if end_time else 0
-
-    log(f"\n🎯 Selected: {best['question']}")
-    log(f"  Price level: ${level:,.2f}")
-    log(f"  Side: {side.upper()} @ ${price:.3f}")
-    log(f"  Resolves in: {remaining:.0f}s")
+    # Determine side based on momentum
+    if direction == "up":
+        side = "yes"
+        trade_rationale = f"{asset} up {momentum['momentum_pct']:+.3f}% w/ {remaining:.0f}s left, YES=${market_yes_price:.3f}"
+    else:
+        side = "no"
+        trade_rationale = f"{asset} down {momentum['momentum_pct']:+.3f}% w/ {remaining:.0f}s left, YES=${market_yes_price:.3f}"
 
     vol_note = ""
     if VOLUME_CONFIDENCE and momentum["volume_ratio"] > 2.0:
         vol_note = f" 📊 (volume: {momentum['volume_ratio']:.1f}x avg)"
 
-    trade_rationale = f"{asset} {direction} {momentum['momentum_pct']:+.3f}%, {side.upper()} 'above ${level:,.0f}' @ ${price:.3f}"
-
     # Size position: target 3000 shares of cheap contracts for max payout
+    price = market_yes_price if side == "yes" else (1 - market_yes_price)
+
+    # Skip contracts over max buy price
+    if price > MAX_BUY_PRICE:
+        log(f"  ⏸️  Buy price ${price:.3f} > ${MAX_BUY_PRICE:.2f} — skip")
+        if not quiet:
+            print(f"📊 {asset} Summary: No trade (buy price ${price:.3f} too high)")
+        return False
+
     target_shares = 3000
     position_size = round(target_shares * price, 2)
     position_size = min(position_size, MAX_POSITION_USD)
-    # Hard floor/ceiling — $1 max per position
     position_size = max(0.10, min(position_size, MAX_POSITION_USD))
 
     if position_size < 0.01:
@@ -1270,23 +1287,31 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
                 print(f"📊 {asset} Summary: No trade (market no longer current)")
             return False
 
-    # Step 4: Import & Trade
+    # Step 5: Import & Trade
     market_id = best.get("simmer_market_id", "")
     if not market_id:
-        # Re-check Simmer for this market before importing
         log(f"\n🔍 Checking Simmer for existing {asset} market...", force=True)
         asset_patterns = ASSET_PATTERNS.get(asset, [asset.lower()])
         existing = simmer_request("/api/sdk/markets", api_key=api_key)
         if existing and isinstance(existing, dict) and "markets" in existing:
             for m in existing["markets"]:
                 mq = (m.get("question") or "").lower()
-                if m.get("status") != "active" or "above" not in mq:
+                if m.get("status") != "active" or "up or down" not in mq:
                     continue
                 if not any(p in mq for p in asset_patterns):
                     continue
-                # Match by price level
-                m_level = _parse_price_level(m.get("question", ""))
-                if m_level and m_level == level:
+                if not _matches_window(m.get("question", ""), asset_window):
+                    continue
+                m_end = None
+                resolves_at = m.get("resolves_at", "")
+                if resolves_at:
+                    try:
+                        resolves_at = resolves_at.replace("Z", "+00:00").replace(" ", "T")
+                        m_end = datetime.fromisoformat(resolves_at)
+                    except Exception:
+                        pass
+                best_end = best.get("end_time")
+                if best_end and m_end and abs((m_end - best_end).total_seconds()) < 60:
                     market_id = m.get("id", "")
                     break
     if market_id:
@@ -1310,9 +1335,9 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
         if latest:
             try:
                 latest_prices = json.loads(latest.get("outcome_prices", "[]"))
-                latest_yes = float(latest_prices[0]) if latest_prices else price
+                latest_yes = float(latest_prices[0]) if latest_prices else market_yes_price
             except (json.JSONDecodeError, IndexError, ValueError):
-                latest_yes = price
+                latest_yes = market_yes_price
             latest_buy = latest_yes if side == "yes" else (1 - latest_yes)
             if latest_buy > MAX_BUY_PRICE:
                 log(f"  ⏸️  Live price ${latest_buy:.3f} > ${MAX_BUY_PRICE:.2f} — skip", force=True)
@@ -1439,7 +1464,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     if redeemed > 0:
         log(f"  Redeemed {redeemed} resolved position(s)")
 
-    # Step 0b: Auto-liquidate any wrong contracts (up/down, 15m, 5m, etc.)
+    # Step 0b: Auto-liquidate any wrong contracts (hourly, daily, above/below, etc.)
     liquidated = liquidate_wrong_contracts(api_key, log_fn=log)
     if liquidated > 0:
         log(f"  Liquidated {liquidated} wrong contract(s)")
