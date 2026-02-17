@@ -783,12 +783,12 @@ def calculate_position_size(api_key, max_size, smart_sizing=False):
 def _has_active_position_for_asset(asset, positions, now_utc):
     """Check if there's already an active fast market position for this specific asset.
     Returns the matching position (or None)."""
-    keyword = ASSET_KEYWORDS.get(asset, asset.lower())
+    keywords = [ASSET_KEYWORDS.get(asset, asset.lower()), asset.lower()]
     for p in positions:
         q = (p.get("question", "") or "").lower()
         if "up or down" not in q:
             continue
-        if keyword not in q:
+        if not any(kw in q for kw in keywords):
             continue  # different asset
         if p.get("redeemable"):
             continue
@@ -802,6 +802,18 @@ def _has_active_position_for_asset(asset, positions, now_utc):
 def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
     """Run one cycle of the fast_market trading strategy for a single asset.
     Returns True if a trade was executed/attempted, False otherwise."""
+
+    # Step 0: Check for existing position FIRST (avoid unnecessary API calls)
+    if not dry_run:
+        existing_positions = get_positions(api_key)
+        if existing_positions:
+            now_check = datetime.now(timezone.utc)
+            existing = _has_active_position_for_asset(asset, existing_positions, now_check)
+            if existing:
+                log(f"  ⏸️  Already have an active {asset} position — skip")
+                if not quiet:
+                    print(f"📊 {asset} Summary: Existing position in '{existing.get('question', 'Unknown')[:50]}...'")
+                return False
 
     # Determine window for this asset (BTC=5m, ETH/SOL=15m)
     asset_window = ASSET_WINDOWS.get(asset, WINDOW)
@@ -862,18 +874,6 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
 
     momentum_pct = abs(momentum["momentum_pct"])
     direction = momentum["direction"]
-
-    # Check for existing position for THIS ASSET only (allow one position per asset)
-    if not dry_run:
-        existing_positions = get_positions(api_key)
-        if existing_positions:
-            now_check = datetime.now(timezone.utc)
-            existing = _has_active_position_for_asset(asset, existing_positions, now_check)
-            if existing:
-                log(f"  ⏸️  Already have an active {asset} position — skip")
-                if not quiet:
-                    print(f"📊 {asset} Summary: Existing position in '{existing.get('question', 'Unknown')[:50]}...'")
-                return False
 
     # Skip if market already repriced (no liquidity / no edge).
     # If YES is far from $0.50, someone already arbed it.
