@@ -950,26 +950,29 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
     market_id = best.get("simmer_market_id", "")
     if not market_id:
         # Re-check Simmer for this market before importing (may have been added since discovery)
-        log(f"\n🔍 Checking Simmer for existing market...", force=True)
+        log(f"\n🔍 Checking Simmer for existing {asset} market...", force=True)
+        asset_patterns = ASSET_PATTERNS.get(asset, [asset.lower()])
         existing = simmer_request("/api/sdk/markets", api_key=api_key)
         if existing and isinstance(existing, dict) and "markets" in existing:
-            best_q = best.get("question", "").lower()
             for m in existing["markets"]:
                 mq = (m.get("question") or "").lower()
-                if m.get("status") == "active" and "up or down" in mq:
-                    # Match by end time (within 60s) or question text
-                    m_end = None
-                    resolves_at = m.get("resolves_at", "")
-                    if resolves_at:
-                        try:
-                            resolves_at = resolves_at.replace("Z", "+00:00").replace(" ", "T")
-                            m_end = datetime.fromisoformat(resolves_at)
-                        except Exception:
-                            pass
-                    best_end = best.get("end_time")
-                    if best_end and m_end and abs((m_end - best_end).total_seconds()) < 60:
-                        market_id = m.get("id", "")
-                        break
+                if m.get("status") != "active" or "up or down" not in mq:
+                    continue
+                # Must match THIS asset's patterns
+                if not any(p in mq for p in asset_patterns):
+                    continue
+                m_end = None
+                resolves_at = m.get("resolves_at", "")
+                if resolves_at:
+                    try:
+                        resolves_at = resolves_at.replace("Z", "+00:00").replace(" ", "T")
+                        m_end = datetime.fromisoformat(resolves_at)
+                    except Exception:
+                        pass
+                best_end = best.get("end_time")
+                if best_end and m_end and abs((m_end - best_end).total_seconds()) < 60:
+                    market_id = m.get("id", "")
+                    break
     if market_id:
         log(f"\n🔗 Using Simmer market: {market_id[:16]}...", force=True)
     else:
@@ -988,15 +991,9 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
         log(f"  Executing {side.upper()} trade for ${position_size:.2f}...", force=True)
         result = execute_trade(api_key, market_id, side, position_size)
 
-        # Treat as success if: explicit success flag, or got shares back, or no error
-        trade_success = bool(
-            result and (
-                result.get("success")
-                or result.get("shares_bought")
-                or result.get("shares")
-                or (not result.get("error") and result.get("trade_id"))
-            )
-        )
+        # Treat as success only if we actually got shares
+        shares_got = float(result.get("shares_bought") or result.get("shares") or 0) if result else 0
+        trade_success = bool(result and shares_got > 0 and not result.get("error"))
         if trade_success:
             shares = result.get("shares_bought") or result.get("shares") or 0
             trade_id = result.get("trade_id")
