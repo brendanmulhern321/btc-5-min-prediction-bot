@@ -6,7 +6,7 @@
   "lookback_minutes": 5,
   "min_time_remaining": 60,
   "assets": ["BTC", "ETH", "SOL", "XRP"],
-  "window": "5m",
+  "window": "1h",
   "signal_source": "kraken",
   "volume_confidence": true
 }

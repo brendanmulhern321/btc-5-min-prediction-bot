@@ -67,8 +67,8 @@ CONFIG_SCHEMA = {
                "help": "Assets to trade, e.g. ['BTC', 'ETH']"},
     "asset": {"default": "", "env": "SIMMER_SPRINT_ASSET", "type": str,
               "help": "(Deprecated) Single asset — use 'assets' list instead"},
-    "window": {"default": "5m", "env": "SIMMER_SPRINT_WINDOW", "type": str,
-               "help": "Market window duration (5m or 15m)"},
+    "window": {"default": "1h", "env": "SIMMER_SPRINT_WINDOW", "type": str,
+               "help": "Market window duration (5m, 15m, or 1h)"},
     "volume_confidence": {"default": True, "env": "SIMMER_SPRINT_VOL_CONF", "type": bool,
                           "help": "Weight signal by volume (higher volume = more confident)"},
 }
@@ -114,10 +114,10 @@ ASSET_PATTERNS = {
 
 # Asset → market window
 ASSET_WINDOWS = {
-    "BTC": "15m",
-    "ETH": "15m",
-    "SOL": "15m",
-    "XRP": "15m",
+    "BTC": "1h",
+    "ETH": "1h",
+    "SOL": "1h",
+    "XRP": "1h",
 }
 
 # Asset → keyword for matching positions (lowercase)
@@ -288,6 +288,26 @@ def _is_15m_market(question):
     return 14 <= diff <= 16  # 15 minutes with tolerance
 
 
+def _is_hourly_market(question):
+    """Check if question describes an hourly market window.
+    Hourly markets have format like 'Bitcoin Up or Down - February 17, 4PM ET'
+    (single time, no range) or a range spanning ~60 minutes."""
+    import re
+    # Single time format (no range): "Month Day, TimeAM/PM ET"
+    if re.search(r'\d{1,2}(?::\d{2})?(AM|PM)\s*ET', question) and '-' not in question.split(',')[-1].split('ET')[0]:
+        return True
+    # Range format: check if ~60 minute span
+    match = re.search(r'(\d{1,2}):(\d{2})(AM|PM)\s*-\s*(\d{1,2}):(\d{2})(AM|PM)', question)
+    if match:
+        h1, m1, p1 = int(match.group(1)), int(match.group(2)), match.group(3)
+        h2, m2, p2 = int(match.group(4)), int(match.group(5)), match.group(6)
+        t1 = (h1 % 12 + (12 if p1 == "PM" else 0)) * 60 + m1
+        t2 = (h2 % 12 + (12 if p2 == "PM" else 0)) * 60 + m2
+        diff = t2 - t1
+        return 55 <= diff <= 65  # ~60 minutes with tolerance
+    return False
+
+
 def _matches_window(question, window):
     """Check if a market question matches the desired window duration.
     Returns False for any unrecognized window or non-matching duration."""
@@ -295,6 +315,8 @@ def _matches_window(question, window):
         return _is_5m_market(question)
     elif window == "15m":
         return _is_15m_market(question)
+    elif window == "1h":
+        return _is_hourly_market(question)
     return False  # reject unknown windows
 
 
@@ -384,14 +406,15 @@ def discover_fast_market_markets(asset="BTC", window="5m", api_key=None):
 
     # Step 2: If no near market on Simmer, build candidate slugs (don't import yet).
     # Import is deferred to trade execution to avoid burning rate-limited API calls.
-    window_seconds = 900 if window == "15m" else 300  # 15m = 900s, 5m = 300s
+    window_seconds = {"5m": 300, "15m": 900, "1h": 3600}.get(window, 300)
     has_near_market = any(
         m.get("end_time") and MIN_TIME_REMAINING < (m["end_time"] - now_utc).total_seconds() <= window_seconds
         for m in markets
     )
-    if not has_near_market and window in ("5m", "15m"):
+    if not has_near_market and window in ("5m", "15m", "1h"):
         now_ts = int(now_utc.timestamp())
         asset_lower = asset.lower()
+        asset_name = ASSET_KEYWORDS.get(asset, asset_lower)  # "bitcoin", "ethereum", etc.
         for offset in range(2):  # current window, then next window
             ws_ts = (now_ts // window_seconds) * window_seconds + (window_seconds * offset)
             we_ts = ws_ts + window_seconds
@@ -407,11 +430,18 @@ def discover_fast_market_markets(asset="BTC", window="5m", api_key=None):
                     break
             if already:
                 continue
-            slug = f"{asset_lower}-updown-{window}-{ws_ts}"
             ws_et = ws_utc - timedelta(hours=5)
             we_et = we_utc - timedelta(hours=5)
+            if window == "1h":
+                # Hourly slug: "bitcoin-up-or-down-february-17-4pm-et"
+                hour_str = ws_et.strftime('%I%p').lstrip('0').lower()  # "4pm", "11am"
+                slug = f"{asset_name}-up-or-down-{ws_et.strftime('%B').lower()}-{ws_et.day}-{hour_str}-et"
+                question = f"{asset} Up or Down - {ws_et.strftime('%B %d')}, {ws_et.strftime('%I%p').lstrip('0')} ET"
+            else:
+                slug = f"{asset_lower}-updown-{window}-{ws_ts}"
+                question = f"{asset} Up or Down - {ws_et.strftime('%B %d')}, {ws_et.strftime('%I:%M%p')}-{we_et.strftime('%I:%M%p')} ET"
             markets.append({
-                "question": f"{asset} Up or Down - {ws_et.strftime('%B %d')}, {ws_et.strftime('%I:%M%p')}-{we_et.strftime('%I:%M%p')} ET",
+                "question": question,
                 "slug": slug,
                 "simmer_market_id": "",
                 "condition_id": "",
@@ -468,7 +498,7 @@ def _parse_fast_market_end_time(question):
 def find_best_fast_market(markets, window="5m"):
     """Pick the best fast_market to trade: soonest expiring that is currently in play."""
     now = datetime.now(timezone.utc)
-    max_remaining = 900 if window == "15m" else 300
+    max_remaining = {"5m": 300, "15m": 900, "1h": 3600}.get(window, 300)
     candidates = []
     for m in markets:
         end_time = m.get("end_time")
@@ -718,7 +748,7 @@ def get_positions(api_key):
 
 
 def liquidate_wrong_contracts(api_key, log_fn=None):
-    """Auto-sell any positions that are NOT 15-minute markets (e.g. hourly contracts).
+    """Auto-sell any positions that are NOT hourly markets (e.g. 15m/5m contracts).
     Skips resolved/expired positions that can't be sold."""
     if log_fn is None:
         log_fn = print
@@ -735,10 +765,10 @@ def liquidate_wrong_contracts(api_key, log_fn=None):
         pos_end = _parse_fast_market_end_time(q)
         if pos_end and pos_end < now_utc:
             continue
-        # Check if this is a 15m market — if not, liquidate it
-        if _is_15m_market(q):
+        # Check if this is an hourly market — if not, liquidate it
+        if _is_hourly_market(q):
             continue  # good, this is what we want
-        # This is a wrong contract (hourly, 5m, etc.) — sell it
+        # This is a wrong contract (15m, 5m, etc.) — sell it
         market_id = pos.get("market_id", "")
         shares_yes = pos.get("shares_yes", 0)
         shares_no = pos.get("shares_no", 0)
@@ -873,11 +903,10 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
                     print(f"📊 {asset} Summary: Existing position in '{existing.get('question', 'Unknown')[:50]}...'")
                 return False
 
-    # Determine window for this asset (BTC=5m, ETH/SOL=15m)
+    # Determine window for this asset
     asset_window = ASSET_WINDOWS.get(asset, WINDOW)
-    # Enter in the last 5 minutes — early enough for liquidity, late enough
-    # that momentum is meaningful
-    max_remaining = 300
+    # For hourly markets, enter in the last 15 minutes for best contract prices
+    max_remaining = {"5m": 300, "15m": 900, "1h": 3600}.get(asset_window, 300)
 
     # Step 1: Discover fast markets for this asset
     log(f"\n🔍 Discovering {asset} fast markets ({asset_window})...")
@@ -1027,8 +1056,8 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
                 # Must match THIS asset's patterns
                 if not any(p in mq for p in asset_patterns):
                     continue
-                # Must be a 15m market, not hourly
-                if not _is_15m_market(m.get("question", "")):
+                # Must match our target window
+                if not _matches_window(m.get("question", ""), asset_window):
                     continue
                 m_end = None
                 resolves_at = m.get("resolves_at", "")
@@ -1192,7 +1221,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     if redeemed > 0:
         log(f"  Redeemed {redeemed} resolved position(s)")
 
-    # Step 0b: Auto-liquidate any wrong contracts (hourlies, 5m, etc.)
+    # Step 0b: Auto-liquidate any wrong contracts (15m, 5m, etc.)
     liquidated = liquidate_wrong_contracts(api_key, log_fn=log)
     if liquidated > 0:
         log(f"  Liquidated {liquidated} wrong contract(s)")
