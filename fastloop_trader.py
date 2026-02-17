@@ -1325,6 +1325,7 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
         log(f"  ✅ Market ID: {market_id[:16]}...", force=True)
 
     trade_success = False
+    trade_unconfirmed = False
     result = None
     if dry_run:
         est_shares = position_size / price if price > 0 else 0
@@ -1349,15 +1350,42 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
         result = execute_trade(api_key, market_id, side, position_size)
         log(f"  API response: {json.dumps(result) if result else 'None'}", force=True)
 
-        # Only count as success if we got real shares back
+        # Count as success only when shares are reported or position is confirmed.
         shares_got = 0
+        order_status = ""
+        fill_status = ""
         if result:
             try:
                 shares_got = float(result.get("shares_bought") or result.get("shares") or 0)
             except (ValueError, TypeError):
                 shares_got = 0
+            order_status = str(result.get("order_status") or "").lower()
+            fill_status = str(result.get("fill_status") or "").lower()
         has_error = bool(result and result.get("error"))
+        trade_submitted = bool(result and result.get("success")) and not has_error
         trade_success = shares_got > 0 and not has_error
+        trade_unconfirmed = (
+            trade_submitted
+            and shares_got <= 0
+            and fill_status in ("unconfirmed", "pending")
+            and order_status in ("matched", "submitted", "accepted", "open")
+        )
+
+        if trade_unconfirmed:
+            log("  ⚠️  Trade accepted but fill is unconfirmed — checking positions...", force=True)
+            time.sleep(2)
+            verify_now = datetime.now(timezone.utc)
+            verify_positions = get_positions(api_key)
+            confirmed = _has_active_position_for_asset(asset, verify_positions, verify_now)
+            if confirmed:
+                shares_yes = float(confirmed.get("shares_yes", 0) or 0)
+                shares_no = float(confirmed.get("shares_no", 0) or 0)
+                shares_got = max(shares_yes, shares_no, shares_got)
+                trade_success = shares_got > 0
+                if trade_success:
+                    log(f"  ✅ Trade confirmed via positions ({shares_got:.1f} shares)", force=True)
+            else:
+                log("  ⚠️  Fill still unconfirmed. Position may update shortly on-chain.", force=True)
 
         if trade_success:
             trade_id = result.get("trade_id")
@@ -1385,7 +1413,7 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
                     volume_ratio=round(momentum["volume_ratio"], 2),
                     signal_source=SIGNAL_SOURCE,
                 )
-        else:
+        elif not trade_unconfirmed:
             error = result.get("error", "Unknown error") if result else "No response"
             log(f"  ❌ Trade failed: {error} (shares={shares_got})", force=True)
 
@@ -1395,7 +1423,9 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
         print(f"\n📊 {asset} Summary:")
         print(f"  Sprint: {best['question'][:50]}")
         print(f"  Signal: {direction} {momentum_pct:.3f}% | YES ${market_yes_price:.3f}")
-        print(f"  Action: {'DRY RUN' if dry_run else ('TRADED' if trade_success else 'FAILED')}")
+        print(
+            f"  Action: {'DRY RUN' if dry_run else ('TRADED' if trade_success else ('PENDING' if trade_unconfirmed else 'FAILED'))}"
+        )
 
     return trade_success
 
