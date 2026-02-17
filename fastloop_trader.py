@@ -972,6 +972,14 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
 
     # Size position: target 10 shares, hard-capped at max_position ($5)
     price = market_yes_price if side == "yes" else (1 - market_yes_price)
+
+    # Skip contracts over 70¢ — bad risk/reward
+    if price > 0.70:
+        log(f"  ⏸️  Buy price ${price:.3f} > $0.70 — bad risk/reward, skip")
+        if not quiet:
+            print(f"📊 {asset} Summary: No trade (buy price ${price:.3f} too high)")
+        return False
+
     target_shares = 10
     position_size = round(target_shares * price, 2)
     position_size = min(position_size, MAX_POSITION_USD)
