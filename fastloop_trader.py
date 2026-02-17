@@ -53,7 +53,7 @@ CONFIG_SCHEMA = {
                          "help": "Min BTC % move in lookback window to trigger"},
     "max_position": {"default": 5.0, "env": "SIMMER_SPRINT_MAX_POSITION", "type": float,
                      "help": "Max $ per trade"},
-    "max_buy_price": {"default": 0.70, "env": "SIMMER_SPRINT_MAX_BUY", "type": float,
+    "max_buy_price": {"default": 0.05, "env": "SIMMER_SPRINT_MAX_BUY", "type": float,
                       "help": "Never buy contracts priced above this"},
     "signal_source": {"default": "binance", "env": "SIMMER_SPRINT_SIGNAL", "type": str,
                       "help": "Price feed source (binance, kraken, coingecko)"},
@@ -75,8 +75,8 @@ CONFIG_SCHEMA = {
 
 TRADE_SOURCE = "sdk:fastloop"
 SMART_SIZING_PCT = 0.50  # 50% of balance per trade
-MIN_SHARES_PER_ORDER = 5  # Polymarket minimum
-MAX_BUY_PRICE = 0.70  # Never buy contracts priced above this (any asset)
+MIN_SHARES_PER_ORDER = 100  # Minimum shares — go big on cheap contracts
+MAX_BUY_PRICE = 0.05  # Never buy contracts priced above this (any asset)
 
 # Asset → Binance symbol mapping
 ASSET_SYMBOLS = {
@@ -980,7 +980,7 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
                 print(f"📊 {asset} Summary: No trade (fees eat the edge)")
             return False
 
-    # Size position: target 10 shares, hard-capped at max_position ($5)
+    # Size position: target 3000 shares of cheap contracts for max payout
     price = market_yes_price if side == "yes" else (1 - market_yes_price)
 
     # Skip contracts over max buy price — bad risk/reward
@@ -990,14 +990,14 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
             print(f"📊 {asset} Summary: No trade (buy price ${price:.3f} too high)")
         return False
 
-    target_shares = 10
+    target_shares = 3000
     position_size = round(target_shares * price, 2)
     position_size = min(position_size, MAX_POSITION_USD)
-    # Hard floor/ceiling
-    position_size = max(0.50, min(position_size, 5.00))
+    # Hard floor/ceiling — $1 max per position
+    position_size = max(0.10, min(position_size, MAX_POSITION_USD))
 
     if position_size < 0.01:
-        log(f"  ⚠️  Price ${price:.3f} too low to size 5 shares")
+        log(f"  ⚠️  Price ${price:.3f} too low to size position")
         return False
 
     log(f"  ✅ Signal: {side.upper()} — {trade_rationale}{vol_note}", force=True)
