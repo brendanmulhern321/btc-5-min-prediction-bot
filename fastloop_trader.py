@@ -501,7 +501,7 @@ def discover_above_below_markets(asset, current_price, api_key=None):
                     "fee_rate_bps": 0,
                 })
 
-    # Step 2: Build candidate slugs for levels not yet on Simmer
+    # Step 2: Import promising levels to get real prices
     now_et = now_utc - timedelta(hours=5)
     # Resolve date: today if before noon ET, otherwise tomorrow
     if now_et.hour < 12:
@@ -513,11 +513,50 @@ def discover_above_below_markets(asset, current_price, api_key=None):
                           17, 0, 0, tzinfo=timezone.utc)
 
     levels = _generate_price_levels(asset, current_price, num_levels=6)
-    for level in levels:
+    # Sort by distance from current price — import furthest levels first (most likely cheap)
+    levels_by_distance = sorted(levels, key=lambda l: abs(l - current_price), reverse=True)
+
+    imported_count = 0
+    max_imports = 4  # limit API calls per asset
+    for level in levels_by_distance:
         if level in seen_levels:
             continue
+        if imported_count >= max_imports:
+            break
         slug = _build_above_slug(asset, level, resolve_date)
         name = ASSET_KEYWORDS.get(asset, asset.lower()).title()
+
+        # Try importing to get real price
+        if api_key:
+            market_id, err = import_fast_market_market(api_key, slug)
+            if market_id:
+                imported_count += 1
+                details = get_market_details(api_key, market_id)
+                yes_price = 0.5
+                if details:
+                    yes_price = details.get("external_price_yes", 0.5)
+                    if yes_price is None:
+                        try:
+                            dp = json.loads(details.get("outcome_prices", "[]"))
+                            yes_price = float(dp[0]) if dp else 0.5
+                        except (json.JSONDecodeError, IndexError, ValueError):
+                            yes_price = 0.5
+                no_price = 1 - yes_price
+                seen_levels.add(level)
+                markets.append({
+                    "question": details.get("question", f"{name} above {level} on {resolve_date.strftime('%B')} {resolve_date.day}?"),
+                    "slug": slug,
+                    "simmer_market_id": market_id,
+                    "condition_id": "",
+                    "end_time": resolve_dt,
+                    "price_level": level,
+                    "outcomes": ["Yes", "No"],
+                    "outcome_prices": json.dumps([str(yes_price), str(no_price)]),
+                    "fee_rate_bps": 0,
+                })
+                continue
+
+        # Fallback: add as unimported candidate
         markets.append({
             "question": f"{name} above {level} on {resolve_date.strftime('%B')} {resolve_date.day}?",
             "slug": slug,
@@ -526,7 +565,7 @@ def discover_above_below_markets(asset, current_price, api_key=None):
             "end_time": resolve_dt,
             "price_level": level,
             "outcomes": ["Yes", "No"],
-            "outcome_prices": json.dumps(["0.5", "0.5"]),  # unknown until imported
+            "outcome_prices": json.dumps(["0.5", "0.5"]),
             "fee_rate_bps": 0,
         })
 
