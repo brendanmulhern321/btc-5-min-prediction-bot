@@ -377,14 +377,14 @@ def discover_fast_market_markets(asset="BTC", window="5m", api_key=None):
                     "fee_rate_bps": 0,
                 })
 
-    # Step 2: If no near market on Simmer, eagerly import from Polymarket.
-    # Try the current and next window to maximise chance of finding a live market.
+    # Step 2: If no near market on Simmer, build candidate slugs (don't import yet).
+    # Import is deferred to trade execution to avoid burning rate-limited API calls.
     window_seconds = 900 if window == "15m" else 300  # 15m = 900s, 5m = 300s
     has_near_market = any(
         m.get("end_time") and MIN_TIME_REMAINING < (m["end_time"] - now_utc).total_seconds() <= window_seconds
         for m in markets
     )
-    if not has_near_market and window in ("5m", "15m") and api_key:
+    if not has_near_market and window in ("5m", "15m"):
         now_ts = int(now_utc.timestamp())
         asset_lower = asset.lower()
         for offset in range(2):  # current window, then next window
@@ -403,21 +403,18 @@ def discover_fast_market_markets(asset="BTC", window="5m", api_key=None):
             if already:
                 continue
             slug = f"{asset_lower}-updown-{window}-{ws_ts}"
-            market_id, err = import_fast_market_market(api_key, slug)
             ws_et = ws_utc - timedelta(hours=5)
             we_et = we_utc - timedelta(hours=5)
             markets.append({
                 "question": f"{asset} Up or Down - {ws_et.strftime('%B %d')}, {ws_et.strftime('%I:%M%p')}-{we_et.strftime('%I:%M%p')} ET",
                 "slug": slug,
-                "simmer_market_id": market_id or "",
+                "simmer_market_id": "",
                 "condition_id": "",
                 "end_time": we_end,
                 "outcomes": ["Yes", "No"],
                 "outcome_prices": json.dumps(["0.5", "0.5"]),
                 "fee_rate_bps": 0,
             })
-            if market_id:
-                break  # successfully imported, no need to try next window
 
     return markets
 
@@ -951,6 +948,28 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
 
     # Step 5: Import & Trade
     market_id = best.get("simmer_market_id", "")
+    if not market_id:
+        # Re-check Simmer for this market before importing (may have been added since discovery)
+        log(f"\n🔍 Checking Simmer for existing market...", force=True)
+        existing = simmer_request("/api/sdk/markets", api_key=api_key)
+        if existing and isinstance(existing, dict) and "markets" in existing:
+            best_q = best.get("question", "").lower()
+            for m in existing["markets"]:
+                mq = (m.get("question") or "").lower()
+                if m.get("status") == "active" and "up or down" in mq:
+                    # Match by end time (within 60s) or question text
+                    m_end = None
+                    resolves_at = m.get("resolves_at", "")
+                    if resolves_at:
+                        try:
+                            resolves_at = resolves_at.replace("Z", "+00:00").replace(" ", "T")
+                            m_end = datetime.fromisoformat(resolves_at)
+                        except Exception:
+                            pass
+                    best_end = best.get("end_time")
+                    if best_end and m_end and abs((m_end - best_end).total_seconds()) < 60:
+                        market_id = m.get("id", "")
+                        break
     if market_id:
         log(f"\n🔗 Using Simmer market: {market_id[:16]}...", force=True)
     else:
