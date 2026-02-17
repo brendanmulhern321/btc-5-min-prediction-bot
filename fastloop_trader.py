@@ -983,6 +983,7 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
             return False
         log(f"  ✅ Market ID: {market_id[:16]}...", force=True)
 
+    trade_success = False
     result = None
     if dry_run:
         est_shares = position_size / price if price > 0 else 0
@@ -990,19 +991,26 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
     else:
         log(f"  Executing {side.upper()} trade for ${position_size:.2f}...", force=True)
         result = execute_trade(api_key, market_id, side, position_size)
+        log(f"  API response: {json.dumps(result) if result else 'None'}", force=True)
 
-        # Treat as success only if we actually got shares
-        shares_got = float(result.get("shares_bought") or result.get("shares") or 0) if result else 0
-        trade_success = bool(result and shares_got > 0 and not result.get("error"))
+        # Only count as success if we got real shares back
+        shares_got = 0
+        if result:
+            try:
+                shares_got = float(result.get("shares_bought") or result.get("shares") or 0)
+            except (ValueError, TypeError):
+                shares_got = 0
+        has_error = bool(result and result.get("error"))
+        trade_success = shares_got > 0 and not has_error
+
         if trade_success:
-            shares = result.get("shares_bought") or result.get("shares") or 0
             trade_id = result.get("trade_id")
-            log(f"  ✅ Bought {shares:.1f} {side.upper()} shares @ ${price:.3f}", force=True)
+            log(f"  ✅ Bought {shares_got:.1f} {side.upper()} shares @ ${price:.3f}", force=True)
 
             # Discord notification — trade entry
             send_discord_notification(
                 f"🟢 **TRADE ENTRY | {asset}**\n"
-                f"Bought {shares:.1f} {side.upper()} shares @ ${price:.3f}\n"
+                f"Bought {shares_got:.1f} {side.upper()} shares @ ${price:.3f}\n"
                 f"Market: {best['question']}\n"
                 f"Signal: {direction} {momentum['momentum_pct']:+.3f}% momentum | Volume {momentum['volume_ratio']:.1f}x avg\n"
                 f"Size: ${position_size:.2f} | Expires in {remaining:.0f}s"
@@ -1023,18 +1031,17 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
                 )
         else:
             error = result.get("error", "Unknown error") if result else "No response"
-            log(f"  ❌ Trade failed: {error}", force=True)
+            log(f"  ❌ Trade failed: {error} (shares={shares_got})", force=True)
 
     # Summary
-    total_trades = 0 if dry_run else (1 if result and not result.get("error") else 0)
-    show_summary = not quiet or total_trades > 0
+    show_summary = not quiet or trade_success
     if show_summary:
         print(f"\n📊 {asset} Summary:")
         print(f"  Sprint: {best['question'][:50]}")
         print(f"  Signal: {direction} {momentum_pct:.3f}% | YES ${market_yes_price:.3f}")
-        print(f"  Action: {'DRY RUN' if dry_run else ('TRADED' if total_trades else 'FAILED')}")
+        print(f"  Action: {'DRY RUN' if dry_run else ('TRADED' if trade_success else 'FAILED')}")
 
-    return total_trades > 0
+    return trade_success
 
 
 def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=False,
