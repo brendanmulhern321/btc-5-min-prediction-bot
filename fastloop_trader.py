@@ -988,7 +988,16 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
         log(f"  Executing {side.upper()} trade for ${position_size:.2f}...", force=True)
         result = execute_trade(api_key, market_id, side, position_size)
 
-        if result and result.get("success"):
+        # Treat as success if: explicit success flag, or got shares back, or no error
+        trade_success = bool(
+            result and (
+                result.get("success")
+                or result.get("shares_bought")
+                or result.get("shares")
+                or (not result.get("error") and result.get("trade_id"))
+            )
+        )
+        if trade_success:
             shares = result.get("shares_bought") or result.get("shares") or 0
             trade_id = result.get("trade_id")
             log(f"  ✅ Bought {shares:.1f} {side.upper()} shares @ ${price:.3f}", force=True)
@@ -1020,7 +1029,7 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
             log(f"  ❌ Trade failed: {error}", force=True)
 
     # Summary
-    total_trades = 0 if dry_run else (1 if result and result.get("success") else 0)
+    total_trades = 0 if dry_run else (1 if result and not result.get("error") else 0)
     show_summary = not quiet or total_trades > 0
     if show_summary:
         print(f"\n📊 {asset} Summary:")
