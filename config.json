@@ -2,6 +2,7 @@
   "entry_threshold": 0.05,
   "min_momentum_pct": 0.15,
   "max_position": 5.0,
+  "max_buy_price": 0.7,
   "lookback_minutes": 5,
   "min_time_remaining": 60,
   "assets": ["BTC", "ETH", "SOL", "XRP"],

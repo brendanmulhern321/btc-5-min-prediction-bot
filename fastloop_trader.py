@@ -53,6 +53,8 @@ CONFIG_SCHEMA = {
                          "help": "Min BTC % move in lookback window to trigger"},
     "max_position": {"default": 5.0, "env": "SIMMER_SPRINT_MAX_POSITION", "type": float,
                      "help": "Max $ per trade"},
+    "max_buy_price": {"default": 0.70, "env": "SIMMER_SPRINT_MAX_BUY", "type": float,
+                      "help": "Never buy contracts priced above this"},
     "signal_source": {"default": "binance", "env": "SIMMER_SPRINT_SIGNAL", "type": str,
                       "help": "Price feed source (binance, kraken, coingecko)"},
     "lookback_minutes": {"default": 5, "env": "SIMMER_SPRINT_LOOKBACK", "type": int,
@@ -74,6 +76,7 @@ CONFIG_SCHEMA = {
 TRADE_SOURCE = "sdk:fastloop"
 SMART_SIZING_PCT = 0.50  # 50% of balance per trade
 MIN_SHARES_PER_ORDER = 5  # Polymarket minimum
+MAX_BUY_PRICE = 0.70  # Never buy contracts priced above this (any asset)
 
 # Asset → Binance symbol mapping
 ASSET_SYMBOLS = {
@@ -185,6 +188,7 @@ cfg = _load_config(CONFIG_SCHEMA, __file__)
 ENTRY_THRESHOLD = cfg["entry_threshold"]
 MIN_MOMENTUM_PCT = cfg["min_momentum_pct"]
 MAX_POSITION_USD = cfg["max_position"]
+MAX_BUY_PRICE = cfg["max_buy_price"]
 SIGNAL_SOURCE = cfg["signal_source"]
 LOOKBACK_MINUTES = cfg["lookback_minutes"]
 MIN_TIME_REMAINING = cfg["min_time_remaining"]
@@ -979,9 +983,9 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
     # Size position: target 10 shares, hard-capped at max_position ($5)
     price = market_yes_price if side == "yes" else (1 - market_yes_price)
 
-    # Skip contracts over 70¢ — bad risk/reward
-    if price > 0.70:
-        log(f"  ⏸️  Buy price ${price:.3f} > $0.70 — bad risk/reward, skip")
+    # Skip contracts over max buy price — bad risk/reward
+    if price > MAX_BUY_PRICE:
+        log(f"  ⏸️  Buy price ${price:.3f} > ${MAX_BUY_PRICE:.2f} — bad risk/reward, skip")
         if not quiet:
             print(f"📊 {asset} Summary: No trade (buy price ${price:.3f} too high)")
         return False
@@ -1054,6 +1058,21 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
         est_shares = position_size / price if price > 0 else 0
         log(f"  [DRY RUN] Would buy {side.upper()} ${position_size:.2f} (~{est_shares:.1f} shares)", force=True)
     else:
+        # Final guard: re-check live market price before submitting order
+        latest = get_market_details(api_key, market_id)
+        if latest:
+            try:
+                latest_prices = json.loads(latest.get("outcome_prices", "[]"))
+                latest_yes = float(latest_prices[0]) if latest_prices else market_yes_price
+            except (json.JSONDecodeError, IndexError, ValueError):
+                latest_yes = market_yes_price
+            latest_buy = latest_yes if side == "yes" else (1 - latest_yes)
+            if latest_buy > MAX_BUY_PRICE:
+                log(f"  ⏸️  Live price ${latest_buy:.3f} > ${MAX_BUY_PRICE:.2f} — skip", force=True)
+                if not quiet:
+                    print(f"📊 {asset} Summary: No trade (live buy price ${latest_buy:.3f} too high)")
+                return False
+
         log(f"  Executing {side.upper()} trade for ${position_size:.2f}...", force=True)
         result = execute_trade(api_key, market_id, side, position_size)
         log(f"  API response: {json.dumps(result) if result else 'None'}", force=True)
@@ -1130,6 +1149,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"  Entry threshold:  {ENTRY_THRESHOLD} (min divergence from 50¢)")
     log(f"  Min momentum:     {MIN_MOMENTUM_PCT}% (min price move)")
     log(f"  Max position:     ${MAX_POSITION_USD:.2f}")
+    log(f"  Max buy price:    ${MAX_BUY_PRICE:.2f}")
     log(f"  Signal source:    {SIGNAL_SOURCE}")
     log(f"  Lookback:         {LOOKBACK_MINUTES} minutes")
     log(f"  Min time left:    {MIN_TIME_REMAINING}s")
