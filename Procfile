@@ -1,1 +1,1 @@
-worker: python fastloop_trader.py --live --loop 60 --smart-sizing
+worker: python fastloop_trader.py --live --loop 30 --smart-sizing

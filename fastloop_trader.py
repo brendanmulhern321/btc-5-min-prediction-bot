@@ -803,8 +803,9 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
 
     # Determine window for this asset (BTC=5m, ETH/SOL=15m)
     asset_window = ASSET_WINDOWS.get(asset, WINDOW)
-    # Only enter in the last 5 minutes — less time for reversal
-    max_remaining = 300
+    # Late-entry strategy: only enter in the last 2 minutes when the outcome
+    # is nearly decided but the market still prices at ~$0.50
+    max_remaining = 120
 
     # Step 1: Discover fast markets for this asset
     log(f"\n🔍 Discovering {asset} fast markets ({asset_window})...")
@@ -872,50 +873,31 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
                     print(f"📊 {asset} Summary: Existing position in '{existing.get('question', 'Unknown')[:50]}...'")
                 return False
 
-    # Check minimum momentum
-    if momentum_pct < MIN_MOMENTUM_PCT:
-        log(f"  ⏸️  Momentum {momentum_pct:.3f}% < minimum {MIN_MOMENTUM_PCT}% — skip")
-        if not quiet:
-            print(f"📊 {asset} Summary: No trade (momentum too weak: {momentum_pct:.3f}%)")
-        return False
+    # Late-entry strategy: with <2 min left, even a small move is locked in.
+    # Scale the momentum threshold by time remaining — less time = lower bar.
+    time_factor = remaining / 120.0  # 1.0 at 120s, 0.5 at 60s
+    scaled_momentum_min = MIN_MOMENTUM_PCT * time_factor  # e.g. 0.12% * 0.5 = 0.06% at 60s
+    scaled_momentum_min = max(scaled_momentum_min, 0.04)  # floor: never go below 0.04%
 
-    # Multi-timeframe confirmation: check 15-minute trend aligns with 5-minute signal
-    log(f"  Checking 15m trend for confirmation...")
-    momentum_15m = get_momentum(asset, SIGNAL_SOURCE, lookback=15)
-    if momentum_15m:
-        trend_15m = momentum_15m["direction"]
-        trend_pct = abs(momentum_15m["momentum_pct"])
-        log(f"  15m trend: {trend_15m} {momentum_15m['momentum_pct']:+.3f}%")
-        if trend_15m != direction:
-            log(f"  ⏸️  15m trend ({trend_15m}) conflicts with 5m signal ({direction}) — skip")
-            if not quiet:
-                print(f"📊 {asset} Summary: No trade (trend conflict: 5m={direction}, 15m={trend_15m})")
-            return False
-        if trend_pct < 0.1:
-            log(f"  ⏸️  15m trend too flat ({trend_pct:.3f}%) — skip")
-            if not quiet:
-                print(f"📊 {asset} Summary: No trade (15m trend too weak)")
-            return False
+    if momentum_pct < scaled_momentum_min:
+        log(f"  ⏸️  Momentum {momentum_pct:.3f}% < scaled min {scaled_momentum_min:.3f}% ({remaining:.0f}s left) — skip")
+        if not quiet:
+            print(f"📊 {asset} Summary: No trade (momentum too weak for {remaining:.0f}s remaining)")
+        return False
 
     # Calculate expected fair price based on momentum direction
     if direction == "up":
         side = "yes"
         divergence = 0.50 + ENTRY_THRESHOLD - market_yes_price
-        trade_rationale = f"{asset} up {momentum['momentum_pct']:+.3f}% but YES only ${market_yes_price:.3f}"
+        trade_rationale = f"{asset} up {momentum['momentum_pct']:+.3f}% w/ {remaining:.0f}s left, YES=${market_yes_price:.3f}"
     else:
         side = "no"
         divergence = market_yes_price - (0.50 - ENTRY_THRESHOLD)
-        trade_rationale = f"{asset} down {momentum['momentum_pct']:+.3f}% but YES still ${market_yes_price:.3f}"
+        trade_rationale = f"{asset} down {momentum['momentum_pct']:+.3f}% w/ {remaining:.0f}s left, YES=${market_yes_price:.3f}"
 
-    # Volume confidence: require above-average volume to confirm the move
     vol_note = ""
-    if VOLUME_CONFIDENCE and momentum["volume_ratio"] < 1.5:
-        log(f"  ⏸️  Volume {momentum['volume_ratio']:.2f}x avg < 1.5x minimum — skip")
-        if not quiet:
-            print(f"📊 {asset} Summary: No trade (volume too low: {momentum['volume_ratio']:.2f}x)")
-        return False
-    elif VOLUME_CONFIDENCE and momentum["volume_ratio"] > 3.0:
-        vol_note = f" 📊 (strong volume: {momentum['volume_ratio']:.1f}x avg)"
+    if VOLUME_CONFIDENCE and momentum["volume_ratio"] > 2.0:
+        vol_note = f" 📊 (volume: {momentum['volume_ratio']:.1f}x avg)"
 
     # Check divergence threshold
     if divergence <= 0:
