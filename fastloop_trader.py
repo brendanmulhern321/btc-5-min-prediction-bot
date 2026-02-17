@@ -285,12 +285,13 @@ def _is_15m_market(question):
 
 
 def _matches_window(question, window):
-    """Check if a market question matches the desired window duration."""
+    """Check if a market question matches the desired window duration.
+    Returns False for any unrecognized window or non-matching duration."""
     if window == "5m":
         return _is_5m_market(question)
     elif window == "15m":
         return _is_15m_market(question)
-    return True
+    return False  # reject unknown windows
 
 
 def _import_current_5m_markets(asset, api_key):
@@ -712,6 +713,53 @@ def get_positions(api_key):
     return []
 
 
+def liquidate_wrong_contracts(api_key, log_fn=None):
+    """Auto-sell any positions that are NOT 15-minute markets (e.g. hourly contracts)."""
+    if log_fn is None:
+        log_fn = print
+    positions = get_positions(api_key)
+    liquidated = 0
+    for pos in positions:
+        q = pos.get("question", "") or ""
+        if "up or down" not in q.lower():
+            continue
+        if pos.get("redeemable"):
+            continue  # let redeem handle these
+        # Check if this is a 15m market — if not, liquidate it
+        if _is_15m_market(q):
+            continue  # good, this is what we want
+        # This is a wrong contract (hourly, 5m, etc.) — sell it
+        market_id = pos.get("market_id", "")
+        shares_yes = pos.get("shares_yes", 0)
+        shares_no = pos.get("shares_no", 0)
+        side = "no" if shares_no > shares_yes else "yes"
+        shares = shares_no if shares_no > shares_yes else shares_yes
+        if not market_id or shares <= 0:
+            continue
+        log_fn(f"  ⚠️  Wrong contract detected: {q[:60]}")
+        log_fn(f"  Selling {shares:.1f} {side.upper()} shares...")
+        result = simmer_request("/api/sdk/trade", method="POST", data={
+            "market_id": market_id,
+            "side": side,
+            "shares": shares,
+            "action": "sell",
+            "venue": "polymarket",
+            "source": TRADE_SOURCE,
+        }, api_key=api_key)
+        if result and not result.get("error"):
+            log_fn(f"  ✅ Liquidated successfully")
+            liquidated += 1
+            send_discord_notification(
+                f"⚠️ **AUTO-LIQUIDATED** wrong contract\n"
+                f"Market: {q[:70]}\n"
+                f"Sold {shares:.1f} {side.upper()} shares"
+            )
+        else:
+            error = result.get("error", "Unknown") if result else "No response"
+            log_fn(f"  ❌ Liquidation failed: {error}")
+    return liquidated
+
+
 def redeem_resolved_positions(api_key, log_fn=None):
     """Auto-redeem any resolved positions to reclaim balance."""
     if log_fn is None:
@@ -961,6 +1009,9 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
                 # Must match THIS asset's patterns
                 if not any(p in mq for p in asset_patterns):
                     continue
+                # Must be a 15m market, not hourly
+                if not _is_15m_market(m.get("question", "")):
+                    continue
                 m_end = None
                 resolves_at = m.get("resolves_at", "")
                 if resolves_at:
@@ -1106,6 +1157,11 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     redeemed = redeem_resolved_positions(api_key, log_fn=log)
     if redeemed > 0:
         log(f"  Redeemed {redeemed} resolved position(s)")
+
+    # Step 0b: Auto-liquidate any wrong contracts (hourlies, 5m, etc.)
+    liquidated = liquidate_wrong_contracts(api_key, log_fn=log)
+    if liquidated > 0:
+        log(f"  Liquidated {liquidated} wrong contract(s)")
 
     # Run strategy for each configured asset (max 1 position per asset)
     for asset in ASSETS:
