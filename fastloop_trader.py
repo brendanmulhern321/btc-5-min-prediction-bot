@@ -803,7 +803,8 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
 
     # Determine window for this asset (BTC=5m, ETH/SOL=15m)
     asset_window = ASSET_WINDOWS.get(asset, WINDOW)
-    max_remaining = 900 if asset_window == "15m" else 300
+    # Only enter in the last 5 minutes — less time for reversal
+    max_remaining = 300
 
     # Step 1: Discover fast markets for this asset
     log(f"\n🔍 Discovering {asset} fast markets ({asset_window})...")
@@ -878,6 +879,24 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
             print(f"📊 {asset} Summary: No trade (momentum too weak: {momentum_pct:.3f}%)")
         return False
 
+    # Multi-timeframe confirmation: check 15-minute trend aligns with 5-minute signal
+    log(f"  Checking 15m trend for confirmation...")
+    momentum_15m = get_momentum(asset, SIGNAL_SOURCE, lookback=15)
+    if momentum_15m:
+        trend_15m = momentum_15m["direction"]
+        trend_pct = abs(momentum_15m["momentum_pct"])
+        log(f"  15m trend: {trend_15m} {momentum_15m['momentum_pct']:+.3f}%")
+        if trend_15m != direction:
+            log(f"  ⏸️  15m trend ({trend_15m}) conflicts with 5m signal ({direction}) — skip")
+            if not quiet:
+                print(f"📊 {asset} Summary: No trade (trend conflict: 5m={direction}, 15m={trend_15m})")
+            return False
+        if trend_pct < 0.1:
+            log(f"  ⏸️  15m trend too flat ({trend_pct:.3f}%) — skip")
+            if not quiet:
+                print(f"📊 {asset} Summary: No trade (15m trend too weak)")
+            return False
+
     # Calculate expected fair price based on momentum direction
     if direction == "up":
         side = "yes"
@@ -888,15 +907,15 @@ def _run_for_asset(asset, api_key, dry_run, smart_sizing, quiet, log):
         divergence = market_yes_price - (0.50 - ENTRY_THRESHOLD)
         trade_rationale = f"{asset} down {momentum['momentum_pct']:+.3f}% but YES still ${market_yes_price:.3f}"
 
-    # Volume confidence adjustment
+    # Volume confidence: require above-average volume to confirm the move
     vol_note = ""
-    if VOLUME_CONFIDENCE and momentum["volume_ratio"] < 0.05:
-        log(f"  ⏸️  Low volume ({momentum['volume_ratio']:.2f}x avg) — weak signal, skip")
+    if VOLUME_CONFIDENCE and momentum["volume_ratio"] < 1.5:
+        log(f"  ⏸️  Volume {momentum['volume_ratio']:.2f}x avg < 1.5x minimum — skip")
         if not quiet:
-            print(f"📊 {asset} Summary: No trade (low volume)")
+            print(f"📊 {asset} Summary: No trade (volume too low: {momentum['volume_ratio']:.2f}x)")
         return False
-    elif VOLUME_CONFIDENCE and momentum["volume_ratio"] > 2.0:
-        vol_note = f" 📊 (high volume: {momentum['volume_ratio']:.1f}x avg)"
+    elif VOLUME_CONFIDENCE and momentum["volume_ratio"] > 3.0:
+        vol_note = f" 📊 (strong volume: {momentum['volume_ratio']:.1f}x avg)"
 
     # Check divergence threshold
     if divergence <= 0:
